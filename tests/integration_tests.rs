@@ -14,9 +14,9 @@ fn test_mangowm_lifecycle() {
     std::fs::write(
         &config_file,
         r#"
-border_width=2
-corner_radius=8
-gaps_in=4
+border_px=2
+border_radius=8
+gap_inner_horizontal=4
 "#,
     )
     .unwrap();
@@ -24,10 +24,10 @@ gaps_in=4
     let mut mgr =
         ConfigManager::new(Some(&config_file), Some(&managed_file), Some(&data_dir), true).unwrap();
 
-    assert_eq!(mgr.get("border_width"), Some("2".to_string()));
+    assert_eq!(mgr.get("border_px"), Some("2".to_string()));
 
-    mgr.set("border_width", "3").unwrap();
-    mgr.set("focused_border_color", "#89b4fa").unwrap();
+    mgr.set("border_px", "3").unwrap();
+    mgr.set("focus_color", "#89b4fa").unwrap();
     assert!(mgr.is_dirty());
 
     let res = mgr.apply().unwrap();
@@ -36,8 +36,8 @@ gaps_in=4
     assert!(!mgr.is_dirty());
 
     let managed_text = std::fs::read_to_string(&managed_file).unwrap();
-    assert!(managed_text.contains("border_width=3"));
-    assert!(managed_text.contains("focused_border_color=#89b4fa"));
+    assert!(managed_text.contains("border_px=3"));
+    assert!(managed_text.contains("focus_color=0x89b4faff"));
 
     let main_text = std::fs::read_to_string(&config_file).unwrap();
     assert!(main_text.contains("source=./mango-mod.conf"));
@@ -47,14 +47,14 @@ gaps_in=4
 fn test_mangobar_generation() {
     let bar = Mangobar::default();
     let cfg = generate_config(&bar);
-    assert!(cfg.contains("\"position\": \"top\""));
-    assert!(cfg.contains("\"tag\""));
+    assert!(cfg.contains("\"layer\": \"top\""));
+    assert!(cfg.contains("\"workspaces\""));
     assert!(cfg.contains("\"layout\""));
     assert!(cfg.contains("\"clock\""));
 
     let css = generate_style(&bar);
-    assert!(css.contains("window#mangobar"));
-    assert!(css.contains("#tag button"));
+    assert!(css.contains("#bar"));
+    assert!(css.contains("#tags"));
 }
 
 #[test]
@@ -90,4 +90,25 @@ fn test_presets_coverage() {
     assert!(ids.contains(&"clean"));
     assert!(ids.contains(&"tokyo-night"));
     assert!(ids.contains(&"zen"));
+}
+
+#[test]
+fn test_mango_value_formats() {
+    let tmp = tempdir().unwrap();
+    let config_file = tmp.path().join("config.conf");
+    let managed_file = tmp.path().join("mango-mod.conf");
+    let data_dir = tmp.path().join("data");
+
+    let mut mgr =
+        ConfigManager::new(Some(&config_file), Some(&managed_file), Some(&data_dir), true).unwrap();
+    mgr.set("blur", "true").unwrap();
+    mgr.set("shadows", "off").unwrap();
+    mgr.set("border_color", "#313244").unwrap();
+    assert!(mgr.set("blur", "maybe").is_err());
+    mgr.apply().unwrap();
+
+    let managed_text = std::fs::read_to_string(&managed_file).unwrap();
+    assert!(managed_text.contains("blur=1"));
+    assert!(managed_text.contains("shadows=0"));
+    assert!(managed_text.contains("border_color=0x313244ff"));
 }

@@ -18,21 +18,8 @@ pub fn mangobar_dir() -> PathBuf {
 
 pub fn generate_config(bar: &Mangobar) -> String {
     let mut map = Map::new();
-    map.insert("position".into(), json!(bar.position));
+    map.insert("layer".into(), json!("top"));
     map.insert("height".into(), json!(bar.height));
-    map.insert("spacing".into(), json!(bar.spacing));
-
-    let m = if bar.floating { bar.margin } else { 0 };
-    map.insert(
-        "margin-top".into(),
-        json!(if bar.position == "top" { m } else { 0 }),
-    );
-    map.insert(
-        "margin-bottom".into(),
-        json!(if bar.position == "bottom" { m } else { 0 }),
-    );
-    map.insert("margin-left".into(), json!(m));
-    map.insert("margin-right".into(), json!(m));
 
     map.insert("modules-left".into(), json!(bar.modules.left));
     map.insert("modules-center".into(), json!(bar.modules.center));
@@ -40,30 +27,28 @@ pub fn generate_config(bar: &Mangobar) -> String {
 
     // Module definitions for Mangobar
     map.insert(
-        "tag".into(),
+        "workspaces".into(),
         json!({
-            "format": "{name}",
-            "show-empty": false
+            "hide-empty": true
         }),
     );
     map.insert(
         "layout".into(),
         json!({
-            "format": "[{layout}]"
+            "format": "[{}]"
         }),
     );
     map.insert(
-        "title".into(),
+        "window".into(),
         json!({
             "format": "{}",
-            "max-length": 45
+            "max-length": 400
         }),
     );
     map.insert(
         "clock".into(),
         json!({
-            "format": "󰥔 {:%H:%M}",
-            "tooltip-format": "{:%Y-%m-%d %A}"
+            "format": "󰥔 {:L%H:%M}"
         }),
     );
     map.insert(
@@ -76,12 +61,18 @@ pub fn generate_config(bar: &Mangobar) -> String {
     map.insert(
         "memory".into(),
         json!({
-            "format": "󰍛 {percentage}%",
+            "format": "󰍛 {percent}%",
             "interval": 2
         }),
     );
     map.insert(
-        "volume".into(),
+        "backlight".into(),
+        json!({
+            "format": "{icon} {percent}%"
+        }),
+    );
+    map.insert(
+        "pulseaudio".into(),
         json!({
             "format": "󰕾 {volume}%",
             "format-muted": "󰝟 muted"
@@ -90,8 +81,8 @@ pub fn generate_config(bar: &Mangobar) -> String {
     map.insert(
         "battery".into(),
         json!({
-            "format": "󰁹 {capacity}%",
-            "format-charging": "󰂄 {capacity}%"
+            "format": "󰁹 {percent}%",
+            "icon-charging": "󰂄"
         }),
     );
     map.insert(
@@ -114,24 +105,24 @@ pub fn generate_style(bar: &Mangobar) -> String {
     font-size: 13px;
 }}
 
-window#mangobar {{
+#bar {{
     background-color: {bg};
     color: {fg};
-    border-radius: {radius}px;
+    border-radius: {radius};
 }}
 
-#tag button {{
+#tags {{
     padding: 0 6px;
     color: {fg};
-    background: transparent;
+    background-color: none;
 }}
 
-#tag button.active {{
-    background-color: rgba(255, 255, 255, 0.16);
-    border-radius: {btn_radius}px;
+#tags.active {{
+    background-color: #ffffff29;
+    border-radius: {btn_radius};
 }}
 
-#tag button.occupied {{
+#tags.occupied {{
     color: #89b4fa;
 }}
 
@@ -139,15 +130,15 @@ window#mangobar {{
 #title,
 #clock,
 #cpu,
-#memory,
+#mem,
 #brightness,
 #volume,
 #battery,
 #tray {{
     padding: 0 10px;
     margin: 3px 2px;
-    background-color: rgba(255, 255, 255, 0.08);
-    border-radius: {btn_radius}px;
+    background-color: #ffffff14;
+    border-radius: {btn_radius};
 }}
 "#,
         bg = bar.bg_color,

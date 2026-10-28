@@ -9,6 +9,8 @@ use super::fsutil::{atomic_write, read_text};
 use super::ipc::MangoIpc;
 use super::managed::{read_managed, render, with_source_line, ManagedState};
 use super::parser::{parse_config, ParsedConfig};
+use super::schema::get_schema_pages;
+use super::values::format_value;
 
 #[derive(Debug, Clone, Default)]
 pub struct ApplyResult {
@@ -114,8 +116,18 @@ impl ConfigManager {
         if key.is_empty() || value.contains('\n') {
             bail!("invalid key or value");
         }
+        // Known schema keys are written in the format Mango parses (0/1, 0xRRGGBBAA)
+        let type_name = get_schema_pages()
+            .into_iter()
+            .flat_map(|p| p.options)
+            .find(|o| o.key == key)
+            .map(|o| o.r#type);
+        let value = match type_name {
+            Some(t) => format_value(&t, value)?,
+            None => value.to_string(),
+        };
         self.pending_reset.remove(key);
-        self.pending_set.insert(key.to_string(), value.to_string());
+        self.pending_set.insert(key.to_string(), value);
         Ok(())
     }
 

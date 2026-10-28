@@ -17,8 +17,8 @@ impl MangoIpc {
             return Ok(());
         }
 
-        // Try mango-msg reload if running
-        let _ = Command::new("mango-msg").arg("reload").output();
+        // Try mmsg reload if running
+        let _ = Command::new("mmsg").args(["dispatch", "reload_config"]).output();
         Ok(())
     }
 }

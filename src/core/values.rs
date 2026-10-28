@@ -25,9 +25,8 @@ pub fn parse_color(text: &str) -> Option<String> {
 
     if (t.starts_with("0x") || t.starts_with("0X")) && t.len() == 10 && HEX_RE.is_match(&t[2..]) {
         let h = t[2..].to_lowercase();
-        let aa = &h[0..2];
-        let rrggbb = &h[2..8];
-        return Some(format!("#{}{}", rrggbb, aa));
+        // Mango order: 0xRRGGBBAA
+        return Some(format!("#{}", h));
     }
 
     if t.starts_with("rgba(") && t.ends_with(')') {
@@ -82,11 +81,15 @@ pub fn format_float(val: f64) -> String {
 pub fn format_value(type_name: &str, raw: &str) -> Result<String> {
     match type_name {
         "boolean" => {
+            // Mango reads booleans with atoi(), so "true" would silently mean 0
             let b = parse_bool(raw).ok_or_else(|| anyhow::anyhow!("invalid boolean: {}", raw))?;
-            Ok(format_bool(b).to_string())
+            Ok(if b { "1" } else { "0" }.to_string())
         }
         "color" => {
-            parse_color(raw).ok_or_else(|| anyhow::anyhow!("invalid color: {}", raw))
+            // Mango reads colors with strtol(), so "#rrggbb" is invalid: write 0xRRGGBBAA
+            let c = parse_color(raw).ok_or_else(|| anyhow::anyhow!("invalid color: {}", raw))?;
+            let hex = &c[1..];
+            Ok(if hex.len() == 6 { format!("0x{}ff", hex) } else { format!("0x{}", hex) })
         }
         "int" | "integer" => {
             let num: i64 = raw.trim().parse()?;

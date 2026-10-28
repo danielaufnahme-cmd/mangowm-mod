@@ -13,7 +13,7 @@ pub struct BarModules {
 }
 
 fn default_left() -> Vec<String> {
-    vec!["tag".into(), "layout".into(), "title".into()]
+    vec!["workspaces".into(), "layout".into(), "window".into()]
 }
 fn default_center() -> Vec<String> {
     vec!["clock".into()]
@@ -22,8 +22,8 @@ fn default_right() -> Vec<String> {
     vec![
         "cpu".into(),
         "memory".into(),
-        "brightness".into(),
-        "volume".into(),
+        "backlight".into(),
+        "pulseaudio".into(),
         "battery".into(),
         "tray".into(),
     ]
@@ -41,16 +41,8 @@ impl Default for BarModules {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Mangobar {
-    #[serde(default = "default_position")]
-    pub position: String, // "top" or "bottom"
     #[serde(default = "default_height")]
     pub height: u32,
-    #[serde(default = "default_spacing")]
-    pub spacing: u32,
-    #[serde(default = "default_floating")]
-    pub floating: bool,
-    #[serde(default = "default_margin")]
-    pub margin: u32,
     #[serde(default)]
     pub modules: BarModules,
     #[serde(default = "default_bg")]
@@ -61,23 +53,15 @@ pub struct Mangobar {
     pub radius: u32,
 }
 
-fn default_position() -> String { "top".to_string() }
 fn default_height() -> u32 { 32 }
-fn default_spacing() -> u32 { 6 }
-fn default_floating() -> bool { true }
-fn default_margin() -> u32 { 8 }
-fn default_bg() -> String { "rgba(30, 30, 46, 0.92)".to_string() }
+fn default_bg() -> String { "#1e1e2eeb".to_string() }
 fn default_fg() -> String { "#cdd6f4".to_string() }
 fn default_radius() -> u32 { 10 }
 
 impl Default for Mangobar {
     fn default() -> Self {
         Self {
-            position: default_position(),
             height: default_height(),
-            spacing: default_spacing(),
-            floating: default_floating(),
-            margin: default_margin(),
             modules: BarModules::default(),
             bg_color: default_bg(),
             fg_color: default_fg(),

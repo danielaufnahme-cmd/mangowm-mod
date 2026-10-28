@@ -10,7 +10,7 @@
 ## Features
 
 - **SceneFX Visual Controls:** Configure blur radius, drop shadows, window opacity, border widths, and corner rounding.
-- **Dynamic Layout Management:** Switch between Scroller, Master-Stack, Monocle, Grid, Deck, and Dwindle layouts, and tune master ratios and gaps.
+- **Dynamic Layout Management:** Switch between Scroller, Master-Stack, Monocle, Grid, Deck, and Dwindle layouts, and tune master ratios and gaps (layouts are set through a Mango `tag_rule`).
 - **Mangobar Builder:** Complete status bar generator for `mangobar` with live preview, 9-tag DWL workspace indicators, layout status, window title, system monitors (CPU, RAM, volume, battery, brightness, tray), and CSS theming.
 - **Safe by Design:** Writes only to its own `mango-mod.conf` and injects `source=./mango-mod.conf` so your handwritten `config.conf` remains intact.
 - **Automatic Backups & One-Click Restore:** Backs up configs prior to applying any changes.
@@ -47,8 +47,8 @@ mangowm-mod preset apply tokyo-night
 mangowm-mod schema
 
 # Set a setting
-mangowm-mod set corner_radius 12
-mangowm-mod set focused_border_color "#7aa2f7"
+mangowm-mod set border_radius 12
+mangowm-mod set focus_color "#7aa2f7"
 mangowm-mod apply
 
 # Build and start Mangobar
