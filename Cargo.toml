@@ -1,9 +1,10 @@
 [package]
 name = "mangowm-mod"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
+rust-version = "1.80"
 authors = ["Daniel <geonix.software@proton.me>"]
-description = "Fast, native MangoWM configuration manager and Mangobar ricing tool written in Rust"
+description = "Fast, native MangoWM configuration manager and Mangobar/Waybar bar builder written in Rust"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/danielaufnahme-cmd/mangowm-mod"
@@ -23,11 +24,11 @@ serde_json = "1.0"
 regex = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
-tempfile = "3.10"
-walkdir = "2.5"
 colored = "2.1"
 anyhow = "1.0"
-thiserror = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"

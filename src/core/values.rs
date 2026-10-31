@@ -1,6 +1,6 @@
 //! Color and value utilities for MangoWM configuration.
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -15,9 +15,7 @@ pub fn parse_color(text: &str) -> Option<String> {
     if let Some(stripped) = t.strip_prefix('#') {
         if HEX_RE.is_match(stripped) {
             let h = stripped.to_lowercase();
-            if h.len() == 6 {
-                return Some(format!("#{}", h));
-            } else if h.len() == 8 {
+            if h.len() == 6 || h.len() == 8 {
                 return Some(format!("#{}", h));
             }
         }
@@ -64,7 +62,11 @@ pub fn parse_bool(text: &str) -> Option<bool> {
 }
 
 pub fn format_bool(val: bool) -> &'static str {
-    if val { "true" } else { "false" }
+    if val {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 pub fn format_float(val: f64) -> String {
@@ -79,26 +81,117 @@ pub fn format_float(val: f64) -> String {
 }
 
 pub fn format_value(type_name: &str, raw: &str) -> Result<String> {
+    format_option_value(type_name, &[], raw)
+}
+
+/// Turn user input into the exact text Mango parses for an option of this type.
+pub fn format_option_value(type_name: &str, choices: &[String], raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.contains('\n') || raw.contains('\r') {
+        bail!("value must be a single line");
+    }
     match type_name {
         "boolean" => {
             // Mango reads booleans with atoi(), so "true" would silently mean 0
-            let b = parse_bool(raw).ok_or_else(|| anyhow::anyhow!("invalid boolean: {}", raw))?;
+            let b = parse_bool(raw).ok_or_else(|| anyhow!("invalid boolean: {}", raw))?;
             Ok(if b { "1" } else { "0" }.to_string())
         }
         "color" => {
             // Mango reads colors with strtol(), so "#rrggbb" is invalid: write 0xRRGGBBAA
-            let c = parse_color(raw).ok_or_else(|| anyhow::anyhow!("invalid color: {}", raw))?;
+            let c = parse_color(raw).ok_or_else(|| anyhow!("invalid color: {}", raw))?;
             let hex = &c[1..];
-            Ok(if hex.len() == 6 { format!("0x{}ff", hex) } else { format!("0x{}", hex) })
+            Ok(if hex.len() == 6 {
+                format!("0x{}ff", hex)
+            } else {
+                format!("0x{}", hex)
+            })
         }
         "int" | "integer" => {
-            let num: i64 = raw.trim().parse()?;
+            let num: i64 = raw
+                .parse()
+                .map_err(|_| anyhow!("invalid integer: {}", raw))?;
             Ok(num.to_string())
         }
         "float" => {
-            let num: f64 = raw.trim().parse()?;
+            let num: f64 = raw
+                .parse()
+                .map_err(|_| anyhow!("invalid number: {}", raw))?;
+            if !num.is_finite() {
+                bail!("invalid number: {}", raw);
+            }
             Ok(format_float(num))
         }
-        _ => Ok(raw.trim().to_string()),
+        "enum" => {
+            if choices.iter().any(|c| c == raw) {
+                Ok(raw.to_string())
+            } else {
+                bail!(
+                    "invalid value {:?}: choose one of {}",
+                    raw,
+                    choices.join(", ")
+                )
+            }
+        }
+        "curve" => {
+            // animation_curve_*: exactly four comma-separated numbers (bezier points)
+            let nums = parse_number_list(raw)?;
+            if nums.len() != 4 {
+                bail!("a curve needs exactly 4 numbers, e.g. 0.46,1.0,0.29,1");
+            }
+            Ok(nums
+                .iter()
+                .map(|n| format_float(*n))
+                .collect::<Vec<_>>()
+                .join(","))
+        }
+        "list" => {
+            let items: Vec<&str> = raw.split(',').map(str::trim).collect();
+            if items.iter().any(|i| i.is_empty()) {
+                bail!("empty item in list: {}", raw);
+            }
+            Ok(items.join(","))
+        }
+        "tag_rule" => format_tag_rule(raw),
+        _ => {
+            if raw.is_empty() {
+                bail!("value must not be empty (use reset to remove a setting)");
+            }
+            Ok(raw.to_string())
+        }
     }
+}
+
+fn parse_number_list(raw: &str) -> Result<Vec<f64>> {
+    raw.split(',')
+        .map(|p| {
+            let p = p.trim();
+            p.parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| anyhow!("invalid number in list: {:?}", p))
+        })
+        .collect()
+}
+
+/// Validate a `tag_rule` value such as `id:*,layout_name:scroller`.
+pub fn format_tag_rule(raw: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    for pair in raw.split(',') {
+        let (k, v) = pair
+            .split_once(':')
+            .ok_or_else(|| anyhow!("tag_rule items must be key:value, got {:?}", pair))?;
+        let (k, v) = (k.trim(), v.trim());
+        if !super::items::TAG_RULE_KEYS.contains(&k) {
+            bail!("unknown tag_rule key {:?}", k);
+        }
+        if k == "layout_name" && !super::schema::LAYOUTS.contains(&v) {
+            bail!(
+                "unknown layout {:?}: choose one of {}",
+                v,
+                super::schema::LAYOUTS.join(", ")
+            );
+        }
+        parts.push(format!("{}:{}", k, v));
+    }
+    Ok(parts.join(","))
 }

@@ -25,12 +25,36 @@ pub fn atomic_write<P: AsRef<Path>>(path: P, content: &str) -> Result<()> {
             .with_context(|| format!("failed to sync temp file {}", tmp_path.display()))?;
     }
 
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("failed to rename {} to {}", tmp_path.display(), path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
 pub fn read_text<P: AsRef<Path>>(path: P) -> Result<String> {
     let path = path.as_ref();
     fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+/// Find an executable in `$PATH` without running a shell or `which`.
+pub fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| fs::metadata(p).map(|m| is_executable(&m)).unwrap_or(false))
+}
+
+#[cfg(unix)]
+fn is_executable(m: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    m.is_file() && m.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(m: &fs::Metadata) -> bool {
+    m.is_file()
 }

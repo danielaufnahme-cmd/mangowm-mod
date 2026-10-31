@@ -86,7 +86,8 @@ pub fn list_presets() -> Vec<Preset> {
         Preset {
             id: "glass".into(),
             name: "Glass".into(),
-            description: "Translucent windows with deep blur, soft shadow and hairline borders".into(),
+            description: "Translucent windows with deep blur, soft shadow and hairline borders"
+                .into(),
             settings: BTreeMap::from([
                 ("border_radius".into(), "16".into()),
                 ("border_px".into(), "1".into()),

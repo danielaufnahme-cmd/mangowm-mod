@@ -7,12 +7,14 @@ pub mod managed;
 pub mod manager;
 pub mod parser;
 pub mod schema;
+pub mod schema_data;
 pub mod values;
 
-pub use actions::{get_actions, Action};
+pub use actions::{get_actions, is_known_action, Action};
 pub use backup::{BackupManifest, BackupStore, BackupSummary};
-pub use ipc::MangoIpc;
+pub use ipc::{MangoIpc, ReloadStatus};
 pub use items::{Bind, Monitor, Rule};
-pub use manager::{detect_config, ApplyResult, ConfigManager};
+pub use managed::{parse_managed, render, ManagedState};
+pub use manager::{detect_config, detect_data_dir, ApplyResult, ConfigManager};
 pub use parser::{parse_config, parse_text, ParsedConfig};
-pub use schema::{get_schema_pages, OptionItem, Page};
+pub use schema::{find_option, get_schema_pages, search_options, OptionItem, Page};

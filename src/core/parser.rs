@@ -6,11 +6,42 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-static ASSIGN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([^=]+?)\s*=\s*(.*)$").unwrap());
-static VAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$([A-Za-z0-9_]+)").unwrap());
+static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^([^=]+?)\s*=\s*(.*)$").unwrap());
+// `$name` or `${name}`; names start with a letter or `_` (docs: configuration/basics.md)
+static VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)").unwrap()
+});
 
-pub const LIST_KEYWORDS: &[&str] = &["bind", "rule", "monitor", "tag", "exec_once", "exec", "source"];
+/// Keywords that may repeat (each line adds an item instead of replacing a value).
+/// Names checked against MangoWM 0.18.4 `parse_option()`; `bind` also takes the
+/// flag forms `bindl`, `bindr`, ... (see [`is_list_keyword`]).
+pub const LIST_KEYWORDS: &[&str] = &[
+    "bind",
+    "mousebind",
+    "axisbind",
+    "gesturebind",
+    "switchbind",
+    "window_rule",
+    "window_rule_once",
+    "tag_rule",
+    "layer_rule",
+    "monitor_rule",
+    "device_rule",
+    "env",
+    "exec_once",
+    "exec",
+    "source",
+    "source_optional",
+    "key_mode",
+];
+
+/// True for repeatable keywords, including `bind` with flag letters (`bindl`, `bindsr`, ...).
+pub fn is_list_keyword(key: &str) -> bool {
+    LIST_KEYWORDS.contains(&key)
+        || key
+            .strip_prefix("bind")
+            .is_some_and(|f| !f.is_empty() && f.chars().all(|c| "slrpc".contains(c)))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -55,23 +86,37 @@ impl ParsedConfig {
     }
 }
 
+/// Remove a comment the way Mango does: a line whose first character is `#`
+/// is a comment, and an inline `#` starts a comment only when it follows
+/// whitespace and is not inside single or double quotes.
 pub fn strip_comment(line: &str) -> String {
-    let mut out = String::new();
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '#' {
-            if i + 1 < chars.len() && chars[i + 1] == '#' {
-                out.push('#');
-                i += 2;
-                continue;
-            }
-            break;
-        }
-        out.push(chars[i]);
-        i += 1;
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return String::new();
     }
-    out.trim().to_string()
+    let mut quote: Option<char> = None;
+    let mut prev_space = false;
+    for (i, c) in trimmed.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '#' && prev_space => return trimmed[..i].trim().to_string(),
+            None => {}
+        }
+        prev_space = c.is_whitespace();
+    }
+    trimmed.to_string()
+}
+
+/// Mango strips one pair of matching surrounding quotes from values.
+pub fn strip_quotes(value: &str) -> &str {
+    let b = value.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
 }
 
 pub fn resolve_vars(text: &str, variables: &HashMap<String, String>) -> String {
@@ -81,7 +126,10 @@ pub fn resolve_vars(text: &str, variables: &HashMap<String, String>) -> String {
 
     VAR_RE
         .replace_all(text, |caps: &regex::Captures| {
-            let name = &caps[1];
+            let name = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .map_or("", |m| m.as_str());
             if let Some(val) = variables.get(name) {
                 val.clone()
             } else {
@@ -164,7 +212,7 @@ impl Parser {
 
             if let Some(caps) = ASSIGN_RE.captures(&line) {
                 let key = caps.get(1).unwrap().as_str().trim();
-                let value = caps.get(2).unwrap().as_str().trim();
+                let value = strip_quotes(caps.get(2).unwrap().as_str().trim());
 
                 if key == "var" {
                     if let Some((vname, vval)) = value.split_once(',') {
@@ -177,7 +225,7 @@ impl Parser {
 
                 let resolved_val = resolve_vars(value, &self.result.variables);
 
-                if key == "source" {
+                if key == "source" || key == "source_optional" {
                     if !self.follow_sources {
                         self.result.entries.push(Entry {
                             key: key.to_string(),
@@ -188,6 +236,9 @@ impl Parser {
                         continue;
                     }
                     let target = expand_path(&resolved_val, base_dir);
+                    if key == "source_optional" && !target.exists() {
+                        continue;
+                    }
                     self.parse_file(target);
                     continue;
                 }
