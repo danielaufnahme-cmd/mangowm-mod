@@ -1,6 +1,7 @@
 //! Bar start/stop with a fake `mangobar` script. Own test binary because it
 //! changes PATH and XDG_RUNTIME_DIR (process-wide); everything runs in one
-//! test. No real bar is ever started.
+//! test. No real bar is ever started, and no kill/pkill/ps binaries are
+//! needed (only /bin/sh and sleep for the fake bar).
 
 use mangowm_mod::bar::generate::write_bar_files;
 use mangowm_mod::bar::model::BarConfig;
@@ -95,7 +96,7 @@ fn test_start_stop_fake_bar() {
     assert!(!pid_path.exists());
     assert_eq!(stop_bar(&bar, Some(&out), &data).unwrap(), None);
 
-    // no PID file: pkill fallback matches only "mangobar -c <our config>"
+    // no PID file: the /proc fallback matches only "mangobar -c <our config>"
     let pid3 = start_bar(&bar, Some(&out), &data).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(200));
     fs::remove_file(&pid_path).unwrap();

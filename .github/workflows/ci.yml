@@ -11,7 +11,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -26,7 +26,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.80
       - run: cargo test --locked
 
@@ -49,14 +49,16 @@ jobs:
           - image: alpine:latest
             deps: apk add --no-cache curl gcc musl-dev ca-certificates git tar gzip xz
           - image: opensuse/tumbleweed
-            deps: zypper --non-interactive install curl gcc ca-certificates git tar gzip xz
+            deps: zypper --non-interactive install curl gcc ca-certificates ca-certificates-mozilla git tar gzip xz
     steps:
       - name: Install prerequisites
         run: ${{ matrix.deps }}
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust (rustup, minimal)
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/rustup.sh https://sh.rustup.rs
+          sh /tmp/rustup.sh -y --profile minimal
+          "$HOME/.cargo/bin/rustc" -V
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: cargo test --locked
 
@@ -72,7 +74,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

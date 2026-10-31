@@ -96,11 +96,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # True when cargo exists and is >= MIN_MAJOR.MIN_MINOR
 rust_ok() {
   have cargo || return 1
-  _v="$(cargo --version 2>/dev/null | sed -n 's/^cargo \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')"
-  [ -n "$_v" ] || return 1
-  set -- $_v
-  [ "$1" -gt "$MIN_MAJOR" ] && return 0
-  [ "$1" -eq "$MIN_MAJOR" ] && [ "$2" -ge "$MIN_MINOR" ] && return 0
+  _v="$(cargo --version 2>/dev/null)" || return 1
+  _maj="$(printf '%s\n' "$_v" | sed -n 's/^cargo \([0-9][0-9]*\)\..*/\1/p')"
+  _min="$(printf '%s\n' "$_v" | sed -n 's/^cargo [0-9][0-9]*\.\([0-9][0-9]*\).*/\1/p')"
+  [ -n "$_maj" ] && [ -n "$_min" ] || return 1
+  [ "$_maj" -gt "$MIN_MAJOR" ] && return 0
+  [ "$_maj" -eq "$MIN_MAJOR" ] && [ "$_min" -ge "$MIN_MINOR" ] && return 0
   return 1
 }
 
@@ -208,7 +209,11 @@ install_source() {
     }
     mk_tmp
     say "==> Cloning $REPO_URL"
-    git clone --depth 1 ${VERSION:+--branch "$VERSION"} "$REPO_URL" "$TMP_DIR/mangowm-mod"
+    if [ -n "$VERSION" ]; then
+      git clone --depth 1 --branch "$VERSION" "$REPO_URL" "$TMP_DIR/mangowm-mod"
+    else
+      git clone --depth 1 "$REPO_URL" "$TMP_DIR/mangowm-mod"
+    fi
     SRC_DIR="$TMP_DIR/mangowm-mod"
   fi
   say "==> Building mangowm-mod (release)"

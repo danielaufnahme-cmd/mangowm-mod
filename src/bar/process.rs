@@ -99,77 +99,135 @@ fn wait_gone(pid: u32) -> bool {
     is_alive(pid) != Some(true)
 }
 
-const NO_KILL_TOOLS: &str =
-    "neither `kill` nor `pkill` was found in PATH, so the bar could not be \
-                             stopped; stop it manually (close it or end the process)";
+/// Send SIGTERM. Ok(false) when the process no longer exists.
+#[cfg(unix)]
+fn send_term(pid: u32) -> Result<bool> {
+    let pid_t = libc::pid_t::try_from(pid).map_err(|_| anyhow!("invalid PID {}", pid))?;
+    // SAFETY: kill(2) only takes plain integers.
+    if unsafe { libc::kill(pid_t, libc::SIGTERM) } == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    bail!("could not stop PID {}: {}", pid, err)
+}
+
+#[cfg(not(unix))]
+fn send_term(pid: u32) -> Result<bool> {
+    bail!("stopping PID {} is only supported on Unix systems", pid)
+}
+
+const NO_PKILL: &str = "this system has no /proc and `pkill` was not found in PATH, so the bar \
+                        could not be found; stop it manually (close it or end the process)";
+
+/// Signal `pid` and wait for it to exit; returns the message for the user.
+fn stop_pid(pid: u32, binary: &str) -> Result<Option<String>> {
+    if !send_term(pid)? {
+        return Ok(None);
+    }
+    if !wait_gone(pid) {
+        return Ok(Some(format!(
+            "sent the stop signal to {} (PID {}), but it is still running",
+            binary, pid
+        )));
+    }
+    Ok(Some(format!("stopped {} (PID {})", binary, pid)))
+}
 
 /// Stop the bar MangoWM Mod started. Returns a message about what was done,
 /// or `None` when no bar of ours was running.
 pub fn stop_bar(bar: &BarConfig, dir: Option<&Path>, data_dir: &Path) -> Result<Option<String>> {
     let pid_path = pid_file(data_dir);
     if let Some((pid, binary)) = read_pid_file(&pid_path) {
-        if is_our_process(pid, &binary) {
-            let kill = find_in_path("kill");
-            let status = match kill {
-                Some(k) => Command::new(k)
-                    .arg(pid.to_string())
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .context("failed to run kill")?,
-                None if find_in_path("pkill").is_some() => {
-                    // fall through to the pkill match below
-                    let _ = fs::remove_file(&pid_path);
-                    return pkill_ours(bar, dir);
-                }
-                None => bail!(NO_KILL_TOOLS),
-            };
-            let _ = fs::remove_file(&pid_path);
-            if !status.success() && is_alive(pid) == Some(true) {
-                bail!(
-                    "could not stop {} (PID {}): kill exited with {}",
-                    binary,
-                    pid,
-                    status
-                );
-            }
-            if !wait_gone(pid) {
-                return Ok(Some(format!(
-                    "sent the stop signal to {} (PID {}), but it is still running",
-                    binary, pid
-                )));
-            }
-            return Ok(Some(format!("stopped {} (PID {})", binary, pid)));
-        }
-        // Stale PID file: the process ended or the PID now belongs to something else.
+        let ours = is_our_process(pid, &binary);
+        // Stale PID files (process ended or PID reused) are removed as well.
         let _ = fs::remove_file(&pid_path);
+        if ours {
+            if let Some(msg) = stop_pid(pid, &binary)? {
+                return Ok(Some(msg));
+            }
+        }
     }
-    pkill_ours(bar, dir)
+    stop_by_command_line(bar, dir)
 }
 
-/// Fallback without a usable PID file: `pkill -f "<binary> -c <our config>"`.
-fn pkill_ours(bar: &BarConfig, dir: Option<&Path>) -> Result<Option<String>> {
-    let targets: Vec<(Backend, PathBuf)> = match dir {
-        Some(d) => vec![(bar.backend, d.to_path_buf())],
+/// The bars we may have started: (backend, config path).
+fn our_configs(bar: &BarConfig, dir: Option<&Path>) -> Vec<(Backend, PathBuf)> {
+    match dir {
+        Some(d) => vec![(bar.backend, d.join(CONFIG_FILE))],
         None => [Backend::Mangobar, Backend::Waybar]
             .into_iter()
-            .map(|b| (b, bar_dir(b)))
+            .map(|b| (b, bar_dir(b).join(CONFIG_FILE)))
             .collect(),
-    };
-    let Some(pkill) = find_in_path("pkill") else {
-        if find_in_path("kill").is_some() {
-            // Without a PID file and without pkill there is nothing safe to signal.
-            return Ok(None);
+    }
+}
+
+/// True when `argv` runs `<binary> -c <cfg>`. The binary may be argv[0] or,
+/// for a script started through its interpreter, argv[1].
+fn argv_matches(argv: &[&[u8]], binary: &str, cfg: &[u8]) -> bool {
+    (0..2).any(|i| {
+        argv.len() > i + 2
+            && Path::new(&*String::from_utf8_lossy(argv[i]))
+                .file_name()
+                .is_some_and(|n| n == binary)
+            && argv[i + 1] == b"-c"
+            && argv[i + 2] == cfg
+    })
+}
+
+/// Fallback without a usable PID file: find `<binary> -c <our config>`
+/// in /proc (or with `pkill -f` where there is no /proc).
+fn stop_by_command_line(bar: &BarConfig, dir: Option<&Path>) -> Result<Option<String>> {
+    let targets = our_configs(bar, dir);
+    if !have_proc() {
+        return pkill_ours(&targets);
+    }
+    let me = std::process::id();
+    let mut found: Vec<(u32, &'static str)> = Vec::new();
+    for entry in fs::read_dir("/proc")?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me || is_alive(pid) != Some(true) {
+            continue;
         }
-        bail!(NO_KILL_TOOLS);
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+        for (backend, cfg) in &targets {
+            let cfg = cfg.display().to_string();
+            if argv_matches(&argv, backend.binary(), cfg.as_bytes()) {
+                found.push((pid, backend.binary()));
+            }
+        }
+    }
+    let mut msgs = Vec::new();
+    for (pid, binary) in found {
+        if let Some(msg) = stop_pid(pid, binary)? {
+            msgs.push(msg);
+        }
+    }
+    Ok((!msgs.is_empty()).then(|| msgs.join("; ")))
+}
+
+/// `pkill -f "<binary> -c <our config>"` for systems without /proc.
+fn pkill_ours(targets: &[(Backend, PathBuf)]) -> Result<Option<String>> {
+    let Some(pkill) = find_in_path("pkill") else {
+        bail!(NO_PKILL);
     };
     let mut stopped = Vec::new();
-    for (backend, d) in targets {
+    for (backend, cfg) in targets {
         let pattern = format!(
             "{} -c {}",
             regex_escape(backend.binary()),
-            regex_escape(&d.join(CONFIG_FILE).display().to_string())
+            regex_escape(&cfg.display().to_string())
         );
         let status = Command::new(&pkill)
             .arg("-f")
