@@ -10,7 +10,8 @@ use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::model::{module_base, Backend, BarConfig, MANGOBAR_MODULE_KEYS};
+use super::buttons::{click_command, BarButton, Click};
+use super::model::{memory_displays, module_base, Backend, BarConfig, MANGOBAR_MODULE_KEYS};
 use super::options::find_opt;
 use crate::core::fsutil::atomic_write;
 
@@ -57,10 +58,98 @@ pub fn waybar_module_name(name: &str, mango_modules: bool) -> Option<String> {
     Some(mapped.to_string())
 }
 
+/// Waybar name of a module of this bar: a picture button becomes an
+/// `image#btn-<id>` module, the rest as [`waybar_module_name`].
+fn waybar_name(bar: &BarConfig, name: &str) -> Option<String> {
+    match bar.button_for_module(name) {
+        Some(b) if !b.picture.is_empty() => Some(format!("image#btn-{}", b.id)),
+        _ => waybar_module_name(name, bar.waybar_mango_modules),
+    }
+}
+
+/// Escape text for Waybar's Pango markup.
+fn markup_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Waybar's memory format for a [`super::model::MEMORY_DISPLAYS`] id.
+pub fn waybar_memory_format(display: &str) -> &'static str {
+    match display {
+        "used" => "󰘚 {used:0.1f} GB",
+        "used-total" => "󰘚 {used:0.1f}/{total:0.0f} GB",
+        "both" => "󰘚 {used:0.1f} GB · {percentage}%",
+        _ => "󰘚 {percentage}%",
+    }
+}
+
+/// Config of a custom button: its icon and the two click helpers.
+fn button_module(bar: &BarConfig, b: &BarButton) -> Value {
+    let left = click_command(None, &b.id, Click::Left);
+    let right = click_command(None, &b.id, Click::Right);
+    match bar.backend {
+        // no tooltips and no pictures in Mangobar: emoji, else the label
+        Backend::Mangobar => json!({"format": b.text(), "on-click": left, "on-click-right": right}),
+        Backend::Waybar if !b.picture.is_empty() => {
+            let mut o = json!({
+                "size": bar.font_size * 4 / 3,
+                "on-click": left,
+                "on-click-right": right
+            });
+            if b.label.is_empty() {
+                o["path"] = json!(b.picture);
+                o["tooltip"] = json!(false);
+            } else {
+                // the image module takes a tooltip only from its exec output
+                o["exec"] = json!(format!(
+                    "printf '%s\\n%s\\n' {} {}",
+                    super::login::shell_quote(&b.picture),
+                    super::login::shell_quote(&b.label)
+                ));
+            }
+            o
+        }
+        Backend::Waybar => {
+            let mut o = json!({
+                "format": markup_escape(b.text()),
+                "on-click": left,
+                "on-click-right": right
+            });
+            if b.label.is_empty() || b.emoji.is_empty() {
+                o["tooltip"] = json!(false);
+            } else {
+                o["tooltip-format"] = json!(markup_escape(&b.label));
+            }
+            o
+        }
+    }
+}
+
 /// Notes about modules the selected backend cannot show (or may not have).
 pub fn warnings(bar: &BarConfig) -> Vec<String> {
     let mut out = Vec::new();
+    if !memory_displays(bar.backend)
+        .iter()
+        .any(|(d, _)| *d == bar.memory_display)
+        && bar.modules.all().any(|m| m == "memory")
+    {
+        out.push(format!(
+            "{} shows memory only as a percentage (memory display {:?} is for Waybar)",
+            bar.backend.binary(),
+            bar.memory_display
+        ));
+    }
     if bar.backend != Backend::Waybar {
+        for b in &bar.buttons {
+            if !b.picture.is_empty() && bar.button_section(&b.id).is_some() {
+                out.push(format!(
+                    "button {}: Mangobar cannot draw pictures; it shows {:?} instead (pictures need Waybar)",
+                    b.id,
+                    b.text()
+                ));
+            }
+        }
         return out;
     }
     let mut seen = Vec::new();
@@ -119,6 +208,7 @@ fn module_defaults(bar: &BarConfig, name: &str) -> Value {
             "hideclients" => json!({"format": " {}"}),
             // {load} is the load average, not a percentage
             "cpu" => json!({"format": "󰍛 {usage}%", "interval": 3}),
+            // Mangobar's memory module has only the percentage
             "memory" => json!({"format": "󰘚 {}%", "interval": 5}),
             "backlight" => json!({
                 "format": "{icon} {percent}%",
@@ -172,7 +262,7 @@ fn module_defaults(bar: &BarConfig, name: &str) -> Value {
             "window" if bar.title_length > 0 => json!({"max-length": bar.title_length}),
             "cpu" => json!({"format": "󰍛 {usage}%", "interval": 3, "tooltip": false}),
             "memory" => json!({
-                "format": "󰘚 {percentage}%",
+                "format": waybar_memory_format(&bar.memory_display),
                 "interval": 5,
                 "tooltip-format": "{used:0.1f} / {total:0.1f} GiB"
             }),
@@ -246,10 +336,7 @@ pub fn module_option_value(bar: &BarConfig, module: &str, key: &str) -> Option<V
 fn backend_list(bar: &BarConfig, list: &[String]) -> Vec<String> {
     match bar.backend {
         Backend::Mangobar => list.to_vec(),
-        Backend::Waybar => list
-            .iter()
-            .filter_map(|m| waybar_module_name(m, bar.waybar_mango_modules))
-            .collect(),
+        Backend::Waybar => list.iter().filter_map(|m| waybar_name(bar, m)).collect(),
     }
 }
 
@@ -288,12 +375,16 @@ pub fn generate_config(bar: &BarConfig) -> String {
     for m in bar.modules.all() {
         let name = match bar.backend {
             Backend::Mangobar => m.clone(),
-            Backend::Waybar => match waybar_module_name(m, bar.waybar_mango_modules) {
+            Backend::Waybar => match waybar_name(bar, m) {
                 Some(n) => n,
                 None => continue,
             },
         };
-        let mut obj = match module_defaults(bar, m) {
+        let defaults = match bar.button_for_module(m) {
+            Some(b) => button_module(bar, b),
+            None => module_defaults(bar, m),
+        };
+        let mut obj = match defaults {
             Value::Object(o) => o,
             _ => Map::new(),
         };
@@ -504,7 +595,13 @@ pub fn generate_style(bar: &BarConfig) -> String {
             workspaces = true;
             continue;
         }
-        if let Some(id) = css_id(be, m, bar.waybar_mango_modules) {
+        let id = match bar.button_for_module(m) {
+            Some(b) if be == Backend::Waybar && !b.picture.is_empty() => {
+                Some(format!("#image.btn-{}", b.id))
+            }
+            _ => css_id(be, m, bar.waybar_mango_modules),
+        };
+        if let Some(id) = id {
             if !ids.contains(&id) {
                 ids.push(id);
             }

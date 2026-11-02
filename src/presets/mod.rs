@@ -3,6 +3,7 @@
 //! Every preset is a tiling setup (Mango's `tile` layout on every tag, new
 //! windows join the stack like on Hyprland) with its own colors, gaps and an
 //! original wallpaper (`data/wallpapers/<id>.png`, see `render.py` there).
+//! The user's own presets (see [`user`]) use the same format.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,13 @@ use crate::core::manager::{ApplyResult, ConfigManager};
 use crate::core::schema::find_option;
 use crate::core::values::format_option_value;
 use crate::wallpaper::{finish_wallpaper, stage_wallpaper, WALLPAPER_DIR};
+
+pub mod user;
+pub use user::{
+    all_presets, current_preset, current_preset_id, delete_user_preset, find_any_preset,
+    list_user_presets, overwrite_user_preset, preset_keys, preset_modified, rename_user_preset,
+    save_user_preset, USER_PRESET_DIR,
+};
 
 /// Settings every preset shares: tile all tags, new windows go to the stack.
 pub const TILING: &[(&str, &str)] = &[
@@ -28,6 +36,12 @@ pub struct Preset {
     pub description: String,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// User presets only: the wallpaper saved with it, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallpaper: Option<PathBuf>,
+    /// Saved by the user (`<data dir>/presets/<id>.json`), not built in.
+    #[serde(skip)]
+    pub user: bool,
 }
 
 impl Preset {
@@ -62,6 +76,7 @@ fn preset(
             .chain(settings)
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -233,8 +248,12 @@ pub fn find_preset(name_or_id: &str) -> Option<Preset> {
 }
 
 /// The preset's wallpaper: the installed copy in `<data dir>/wallpapers`, else
-/// the one in the source checkout this binary was built from.
+/// the one in the source checkout this binary was built from. A user preset's
+/// is the picture saved with it.
 pub fn wallpaper_path(data_dir: &Path, p: &Preset) -> Option<PathBuf> {
+    if p.user {
+        return p.wallpaper.clone().filter(|w| w.is_file());
+    }
     let file = p.wallpaper_file();
     [
         data_dir.join(WALLPAPER_DIR).join(&file),
@@ -249,11 +268,12 @@ pub fn wallpaper_path(data_dir: &Path, p: &Preset) -> Option<PathBuf> {
 
 /// Stage the preset's settings and wallpaper (an `exec_once=swaybg ...` that
 /// replaces any other managed swaybg line), apply everything that is staged,
-/// and when Mango confirmed the reload also switch the wallpaper live.
+/// and when Mango confirmed the reload also switch the wallpaper live. A user
+/// preset saved without a wallpaper leaves the wallpaper as it is.
 pub fn apply_preset(mgr: &mut ConfigManager, p: &Preset) -> Result<ApplyResult> {
     // Drop what another preset left behind (e.g. Glass's opacity) when this
     // preset does not set it; values the user picked themselves stay.
-    for other in list_presets() {
+    for other in all_presets(&mgr.data_dir) {
         for (k, v) in other.settings.iter().filter(|(k, _)| !p.settings.contains_key(*k)) {
             let from_preset = find_option(k)
                 .and_then(|o| format_option_value(&o.r#type, &o.choices, v).ok())
@@ -272,12 +292,24 @@ pub fn apply_preset(mgr: &mut ConfigManager, p: &Preset) -> Result<ApplyResult> 
     }
 
     let mut res = mgr.apply()?;
+    if res.ok {
+        if let Err(e) = user::set_current_preset(&mgr.data_dir, &p.id) {
+            res.warnings.push(format!("{:#}", e));
+        }
+    }
     let Some(path) = wallpaper else {
-        res.warnings.push(format!(
-            "wallpaper {} not found in {} (run install.sh); the preset was applied without it",
-            p.wallpaper_file(),
-            mgr.data_dir.join(WALLPAPER_DIR).display()
-        ));
+        match (p.user, &p.wallpaper) {
+            (true, None) => {}
+            (true, Some(w)) => res.warnings.push(format!(
+                "wallpaper {} not found; the preset was applied without it",
+                w.display()
+            )),
+            (false, _) => res.warnings.push(format!(
+                "wallpaper {} not found in {} (run install.sh); the preset was applied without it",
+                p.wallpaper_file(),
+                mgr.data_dir.join(WALLPAPER_DIR).display()
+            )),
+        }
         return Ok(res);
     };
     finish_wallpaper(mgr, &mut res, &path);

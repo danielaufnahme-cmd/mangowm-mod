@@ -1,6 +1,7 @@
 //! Main window: sidebar, page stack, search and the Apply bar.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::{Rc, Weak};
 
@@ -10,10 +11,10 @@ use gtk::glib::{self, clone};
 
 use mangowm_mod::core::ipc::ReloadStatus;
 use mangowm_mod::core::manager::{ApplyResult, ConfigManager};
-use mangowm_mod::core::schema::{get_schema_pages, search_options};
+use mangowm_mod::core::schema::{schema_pages, search_options, OptionItem};
 
 use crate::apply_bar::ApplyBar;
-use crate::ctx::{Context, Ctx};
+use crate::ctx::{timed, Context, Ctx};
 use crate::rows::{build_row, OptionRow};
 use crate::{backups, bar, items, presets, wallpaper, GuiArgs, APP_ID};
 
@@ -51,8 +52,10 @@ const FIXED_PAGES: &[(&str, &str, &str)] = &[
     ("backups", "Backups", "document-open-recent-symbolic"),
 ];
 
-/// Max rows the search page builds at once.
+/// Max rows the search page shows.
 const SEARCH_LIMIT: usize = 80;
+/// Search rows built before the results show; the rest follow in batches this size.
+const SEARCH_FIRST: usize = 16;
 
 fn icon_or_fallback(name: &str) -> &str {
     let has = gtk::gdk::Display::default()
@@ -125,7 +128,15 @@ pub struct WindowState {
     search_group: RefCell<Option<adw::PreferencesGroup>>,
     search_page: adw::PreferencesPage,
     search_rows: RefCell<Vec<OptionRow>>,
-    pub rows: Vec<OptionRow>,
+    /// Every search row built so far, by key (reused while typing).
+    search_cache: RefCell<HashMap<String, OptionRow>>,
+    /// Bumped by every search; stale batches of rows stop.
+    search_gen: std::cell::Cell<u64>,
+    me: RefCell<Weak<Self>>,
+    /// Rows of the schema pages built so far.
+    rows: RefCell<Vec<OptionRow>>,
+    /// Pages already in the stack.
+    built: RefCell<HashSet<String>>,
     pub apply_bar: ApplyBar,
     title: adw::WindowTitle,
     split: adw::NavigationSplitView,
@@ -137,7 +148,7 @@ impl WindowState {
     fn new(window: &adw::ApplicationWindow, mgr: ConfigManager, dry_run: bool) -> Rc<Self> {
         let toasts = adw::ToastOverlay::new();
         let ctx = Context::new(mgr, dry_run, toasts.clone());
-        let pages = get_schema_pages();
+        let pages = schema_pages();
 
         let stack = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
@@ -146,36 +157,13 @@ impl WindowState {
             .vexpand(true)
             .build();
 
-        // schema pages
-        let mut rows = Vec::new();
+        // pages are built on their first visit (open_page), not here
         let mut ids = Vec::new();
         let mut titles = Vec::new();
-        for p in &pages {
-            let page = adw::PreferencesPage::builder()
-                .title(&p.title)
-                .description(glib::markup_escape_text(&p.description).as_str())
-                .build();
-            let group = adw::PreferencesGroup::new();
-            for opt in &p.options {
-                let r = build_row(&ctx, opt);
-                group.add(&r.row);
-                rows.push(r);
-            }
-            page.add(&group);
-            stack.add_named(&page, Some(&p.id));
+        for p in pages {
             ids.push(p.id.clone());
             titles.push((p.id.clone(), p.title.clone()));
         }
-
-        // fixed pages
-        stack.add_named(&items::binds_page(&ctx), Some("binds"));
-        stack.add_named(&items::rules_page(&ctx), Some("rules"));
-        stack.add_named(&items::monitors_page(&ctx), Some("monitors"));
-        stack.add_named(&items::autostart_page(&ctx), Some("autostart"));
-        stack.add_named(&presets::page(&ctx), Some("presets"));
-        stack.add_named(&wallpaper::page(&ctx), Some("wallpaper"));
-        stack.add_named(&bar::page(&ctx), Some("bar"));
-        stack.add_named(&backups::page(&ctx), Some("backups"));
         for (id, title, _) in FIXED_PAGES {
             ids.push(id.to_string());
             titles.push((id.to_string(), title.to_string()));
@@ -328,7 +316,11 @@ impl WindowState {
             search_group: RefCell::new(None),
             search_page,
             search_rows: RefCell::new(Vec::new()),
-            rows,
+            search_cache: RefCell::new(HashMap::new()),
+            search_gen: std::cell::Cell::new(0),
+            me: RefCell::new(Weak::new()),
+            rows: RefCell::new(Vec::new()),
+            built: RefCell::new(HashSet::new()),
             apply_bar,
             title,
             split,
@@ -342,6 +334,7 @@ impl WindowState {
     }
 
     fn connect(&self, weak: Weak<Self>) {
+        *self.me.borrow_mut() = weak.clone();
         let w = weak.clone();
         self.ctx.on_change(move || {
             if let Some(s) = w.upgrade() {
@@ -416,7 +409,7 @@ impl WindowState {
 
     /// Re-read every row and update the Apply bar.
     fn sync(&self) {
-        for r in &self.rows {
+        for r in self.rows.borrow().iter() {
             r.refresh();
         }
         for r in self.search_rows.borrow().iter() {
@@ -428,6 +421,57 @@ impl WindowState {
     }
 
     pub fn open_page(&self, id: &str) {
+        timed(&format!("open_page {}", id), || self.open_page_now(id))
+    }
+
+    /// Build page `id` and add it to the stack, once.
+    fn ensure_page(&self, id: &str) {
+        if !self.built.borrow_mut().insert(id.to_string()) {
+            return;
+        }
+        let ctx = &self.ctx;
+        let widget: gtk::Widget = match id {
+            "binds" => items::binds_page(ctx).upcast(),
+            "rules" => items::rules_page(ctx).upcast(),
+            "monitors" => items::monitors_page(ctx).upcast(),
+            "autostart" => items::autostart_page(ctx).upcast(),
+            "presets" => presets::page(ctx),
+            "wallpaper" => wallpaper::page(ctx),
+            "bar" => bar::page(ctx).upcast(),
+            "backups" => backups::page(ctx).upcast(),
+            _ => {
+                let Some(p) = schema_pages().iter().find(|p| p.id == id) else {
+                    return;
+                };
+                let page = adw::PreferencesPage::builder()
+                    .title(&p.title)
+                    .description(glib::markup_escape_text(&p.description).as_str())
+                    .build();
+                let group = adw::PreferencesGroup::new();
+                let mut rows = self.rows.borrow_mut();
+                for opt in &p.options {
+                    let r = build_row(ctx, opt);
+                    group.add(&r.row);
+                    rows.push(r);
+                }
+                page.add(&group);
+                page.upcast()
+            }
+        };
+        self.stack.add_named(&widget, Some(id));
+    }
+
+    /// The row of setting `key`, building its page if needed (screenshot mode).
+    pub fn row(&self, key: &str) -> Option<OptionRow> {
+        let page = schema_pages()
+            .iter()
+            .find(|p| p.options.iter().any(|o| o.key == key))?;
+        self.ensure_page(&page.id);
+        self.rows.borrow().iter().find(|r| r.key == key).cloned()
+    }
+
+    fn open_page_now(&self, id: &str) {
+        self.ensure_page(id);
         *self.current.borrow_mut() = id.to_string();
         self.stack.set_visible_child_name(id);
         let title = self
@@ -447,34 +491,55 @@ impl WindowState {
     }
 
     pub fn on_search(&self, text: &str) {
+        timed(&format!("search {:?}", text), || self.search_now(text))
+    }
+
+    fn search_now(&self, text: &str) {
         let q = text.trim();
         if q.is_empty() {
             let cur = self.current.borrow().clone();
             self.open_page(&cur);
             return;
         }
+        let gen = self.search_gen.get() + 1;
+        self.search_gen.set(gen);
         if let Some(old) = self.search_group.borrow_mut().take() {
+            // the rows are kept for the next search: take them out of the old group
+            for r in self.search_rows.borrow_mut().drain(..) {
+                old.remove(&r.row);
+            }
             self.search_page.remove(&old);
         }
         let found = search_options(q);
-        let page_of = |key: &str| {
-            get_schema_pages()
-                .into_iter()
-                .find(|p| p.options.iter().any(|o| o.key == key))
-                .map(|p| p.title)
-                .unwrap_or_default()
-        };
         let group = adw::PreferencesGroup::builder()
             .title(glib::markup_escape_text(&format!("{} results", found.len())).as_str())
             .build();
-        let mut rows = Vec::new();
-        for opt in found.iter().take(SEARCH_LIMIT) {
-            let r = build_row(&self.ctx, opt);
-            if let Some(ar) = r.row.downcast_ref::<adw::ActionRow>() {
-                ar.set_subtitle(&format!("{} · {}", page_of(&opt.key), opt.key));
-            }
-            group.add(&r.row);
-            rows.push(r);
+        let shown: Vec<OptionItem> = found.iter().take(SEARCH_LIMIT).cloned().collect();
+        let (now, later) = shown.split_at(SEARCH_FIRST.min(shown.len()));
+        for opt in now {
+            self.add_search_row(&group, opt);
+        }
+        if !later.is_empty() {
+            // the rest when idle, so typing never waits for a long result list
+            let (w, group, later) = (self.me.borrow().clone(), group.clone(), later.to_vec());
+            let mut done = 0;
+            glib::idle_add_local(move || {
+                let Some(s) = w.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if s.search_gen.get() != gen {
+                    return glib::ControlFlow::Break;
+                }
+                for opt in later.iter().skip(done).take(SEARCH_FIRST) {
+                    s.add_search_row(&group, opt);
+                }
+                done += SEARCH_FIRST;
+                if done < later.len() {
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
+            });
         }
         if found.len() > SEARCH_LIMIT {
             group.set_description(Some(&format!(
@@ -484,7 +549,6 @@ impl WindowState {
         }
         self.search_page.add(&group);
         *self.search_group.borrow_mut() = Some(group);
-        *self.search_rows.borrow_mut() = rows;
         self.title.set_title("Search");
         self.silent.set(true);
         self.list.unselect_all();
@@ -495,6 +559,34 @@ impl WindowState {
             "search"
         });
         self.split.set_show_content(true);
+    }
+
+    /// Add the search row of `opt`, reusing the one built by an earlier search.
+    fn add_search_row(&self, group: &adw::PreferencesGroup, opt: &OptionItem) {
+        let cached = self.search_cache.borrow().get(&opt.key).cloned();
+        let r = match cached {
+            Some(r) => {
+                r.refresh();
+                r
+            }
+            None => {
+                let r = build_row(&self.ctx, opt);
+                if let Some(ar) = r.row.downcast_ref::<adw::ActionRow>() {
+                    let page = schema_pages()
+                        .iter()
+                        .find(|p| p.options.iter().any(|o| o.key == opt.key))
+                        .map(|p| p.title.as_str())
+                        .unwrap_or_default();
+                    ar.set_subtitle(&format!("{} · {}", page, opt.key));
+                }
+                self.search_cache
+                    .borrow_mut()
+                    .insert(opt.key.clone(), r.clone());
+                r
+            }
+        };
+        group.add(&r.row);
+        self.search_rows.borrow_mut().push(r);
     }
 
     pub fn apply(&self) {

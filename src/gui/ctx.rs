@@ -3,11 +3,38 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use gtk::glib;
 use mangowm_mod::core::manager::ConfigManager;
 
 pub type Ctx = Rc<Context>;
+
+/// `MANGOWM_MOD_PROFILE=1`: time the main-thread hot paths (stderr).
+pub fn profiling() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MANGOWM_MOD_PROFILE").is_some())
+}
+
+/// Run `f`; with profiling on, print how long it took.
+pub fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
+    if !profiling() {
+        return f();
+    }
+    let t = Instant::now();
+    let out = f();
+    since(t, what);
+    out
+}
+
+/// With profiling on, print the time from `start` to now.
+pub fn since(start: Instant, what: &str) {
+    if profiling() {
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("profile: {:>8.2} ms  {}", ms, what);
+    }
+}
 
 pub struct Context {
     pub mgr: RefCell<ConfigManager>,
@@ -38,9 +65,11 @@ impl Context {
     /// Tell every page to re-read the manager (no borrow is held while they run).
     pub fn changed(&self) {
         let listeners: Vec<Rc<dyn Fn()>> = self.listeners.borrow().clone();
-        for f in listeners {
-            f();
-        }
+        timed("change listeners", || {
+            for f in listeners {
+                f();
+            }
+        });
     }
 
     pub fn toast(&self, text: &str) {

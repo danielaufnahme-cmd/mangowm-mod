@@ -4,7 +4,13 @@
 //!
 //! Colors: neutral dark greys with one restrained accent (teal #76ccb1).
 
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use super::model::{module_base, BarConfig};
+use crate::core::fsutil::atomic_write;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BarPreset {
@@ -269,4 +275,194 @@ impl BarPreset {
         self.apply(&mut out);
         out
     }
+}
+
+// ---- the user's own presets ----
+
+/// Prefix of a user preset's id in [`BarConfig::preset`].
+pub const USER_PREFIX: &str = "user:";
+
+/// A bar look the user saved: every setting except the per-machine ones
+/// (program, login start, monitors).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserPreset {
+    /// File stem in [`user_presets_dir`].
+    #[serde(skip)]
+    pub slug: String,
+    pub name: String,
+    pub bar: BarConfig,
+}
+
+pub fn user_presets_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("bar-presets")
+}
+
+/// "My Bar 2" -> "my-bar-2".
+pub fn slugify(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_end_matches('-').to_string();
+    if out.is_empty() {
+        "preset".to_string()
+    } else {
+        out
+    }
+}
+
+/// Copy `bar` without its per-machine settings and the preset mark.
+fn portable(bar: &BarConfig) -> BarConfig {
+    let mut out = bar.clone();
+    let base = BarConfig::default();
+    out.backend = base.backend;
+    out.start_at_login = base.start_at_login;
+    out.output = base.output;
+    out.preset = None;
+    out
+}
+
+impl UserPreset {
+    pub fn id(&self) -> String {
+        format!("{}{}", USER_PREFIX, self.slug)
+    }
+
+    fn path(&self, data_dir: &Path) -> PathBuf {
+        user_presets_dir(data_dir).join(format!("{}.json", self.slug))
+    }
+
+    fn save(&self, data_dir: &Path) -> Result<()> {
+        atomic_write(
+            self.path(data_dir),
+            &(serde_json::to_string_pretty(self)? + "\n"),
+        )
+    }
+
+    /// Set the preset's settings on `bar`; the program, login start and
+    /// monitors stay.
+    pub fn apply(&self, bar: &mut BarConfig) {
+        let keep = (bar.backend, bar.start_at_login, bar.output.clone(), bar.preset.clone());
+        *bar = self.bar.clone();
+        (bar.backend, bar.start_at_login, bar.output, bar.preset) = keep;
+    }
+
+    pub fn applied_to(&self, bar: &BarConfig) -> BarConfig {
+        let mut out = bar.clone();
+        self.apply(&mut out);
+        out
+    }
+}
+
+/// The user's presets, sorted by name. Unreadable files are skipped.
+pub fn list_user_presets(data_dir: &Path) -> Vec<UserPreset> {
+    let Ok(entries) = fs::read_dir(user_presets_dir(data_dir)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<UserPreset> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension()? != "json" {
+                return None;
+            }
+            let slug = path.file_stem()?.to_str()?.to_string();
+            let text = fs::read_to_string(&path).ok()?;
+            let mut p: UserPreset = serde_json::from_str(&text).ok()?;
+            p.slug = slug;
+            p.bar.validate().ok()?;
+            Some(p)
+        })
+        .collect();
+    out.sort_by_key(|p| p.name.to_lowercase());
+    out
+}
+
+pub fn find_user_preset(data_dir: &Path, slug: &str) -> Option<UserPreset> {
+    list_user_presets(data_dir).into_iter().find(|p| p.slug == slug)
+}
+
+fn check_name(data_dir: &Path, name: &str, except: Option<&str>) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("type a name for the preset");
+    }
+    if name.chars().count() > 40 {
+        bail!("preset name must be 40 characters or less");
+    }
+    let taken = BAR_PRESETS
+        .iter()
+        .any(|p| p.name.eq_ignore_ascii_case(name))
+        || list_user_presets(data_dir)
+            .iter()
+            .any(|p| Some(p.slug.as_str()) != except && p.name.eq_ignore_ascii_case(name));
+    if taken {
+        bail!("there is already a preset called “{}”", name);
+    }
+    Ok(name.to_string())
+}
+
+/// Save `bar` as a new preset called `name`.
+pub fn save_user_preset(data_dir: &Path, name: &str, bar: &BarConfig) -> Result<UserPreset> {
+    let name = check_name(data_dir, name, None)?;
+    bar.validate()?;
+    let base = slugify(&name);
+    let mut slug = base.clone();
+    let mut n = 2;
+    while user_presets_dir(data_dir)
+        .join(format!("{}.json", slug))
+        .exists()
+    {
+        slug = format!("{}-{}", base, n);
+        n += 1;
+    }
+    let preset = UserPreset {
+        slug,
+        name,
+        bar: portable(bar),
+    };
+    preset.save(data_dir)?;
+    Ok(preset)
+}
+
+/// Replace a user preset's settings with `bar`.
+pub fn overwrite_user_preset(data_dir: &Path, slug: &str, bar: &BarConfig) -> Result<UserPreset> {
+    let mut p = find_user_preset(data_dir, slug).context("no such preset")?;
+    bar.validate()?;
+    p.bar = portable(bar);
+    p.save(data_dir)?;
+    Ok(p)
+}
+
+pub fn rename_user_preset(data_dir: &Path, slug: &str, name: &str) -> Result<UserPreset> {
+    let mut p = find_user_preset(data_dir, slug).context("no such preset")?;
+    p.name = check_name(data_dir, name, Some(slug))?;
+    p.save(data_dir)?;
+    Ok(p)
+}
+
+/// Delete a user preset. Built-in presets cannot be deleted.
+pub fn delete_user_preset(data_dir: &Path, id: &str) -> Result<()> {
+    let slug = id.strip_prefix(USER_PREFIX).unwrap_or(id);
+    if !id.starts_with(USER_PREFIX) && find_bar_preset(id).is_some() {
+        bail!("built-in presets cannot be deleted");
+    }
+    let p = find_user_preset(data_dir, slug).context("no such preset")?;
+    let path = p.path(data_dir);
+    fs::remove_file(&path).with_context(|| format!("failed to delete {}", path.display()))
+}
+
+/// Whether `bar` still has the settings of the preset it last applied:
+/// `None` when no known preset was applied.
+pub fn preset_state(bar: &BarConfig, data_dir: &Path) -> Option<(String, bool)> {
+    let id = bar.preset.clone()?;
+    let same = if let Some(slug) = id.strip_prefix(USER_PREFIX) {
+        find_user_preset(data_dir, slug)?.applied_to(bar) == *bar
+    } else {
+        find_bar_preset(&id)?.applied_to(bar) == *bar
+    };
+    Some((id, same))
 }

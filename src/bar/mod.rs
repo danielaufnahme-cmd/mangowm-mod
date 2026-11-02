@@ -1,3 +1,4 @@
+pub mod buttons;
 pub mod generate;
 pub mod login;
 pub mod model;

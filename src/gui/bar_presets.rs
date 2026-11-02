@@ -5,12 +5,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::cairo;
+use gtk::{cairo, gio, glib};
 
 use mangowm_mod::bar::generate::{alpha, mangobar_continuous, surface_color};
 use mangowm_mod::bar::model::{module_base, Backend, BarConfig};
-use mangowm_mod::bar::presets::{BarPreset, BAR_PRESETS};
-use mangowm_mod::bar::process::our_bar_running;
+use mangowm_mod::bar::presets::{
+    delete_user_preset, find_user_preset, list_user_presets, overwrite_user_preset,
+    rename_user_preset, save_user_preset, BarPreset, UserPreset, BAR_PRESETS,
+};
 
 use super::BarPage;
 use crate::logic::color_to_rgba;
@@ -21,11 +23,6 @@ const SCREEN_W: f64 = 600.0;
 /// Right-section modules drawn (plus the tray), so the card is not crowded.
 const RIGHT_MAX: usize = 2;
 
-pub struct Presets {
-    cards: Vec<(&'static BarPreset, gtk::Button, gtk::DrawingArea, gtk::Label)>,
-    /// The saved bar; the previews show each preset applied to it.
-    current: Rc<RefCell<BarConfig>>,
-}
 
 fn set_color(cr: &cairo::Context, color: &str) {
     let c = color_to_rgba(color).unwrap_or([0.0, 0.0, 0.0, 1.0]);
@@ -226,14 +223,76 @@ fn draw_bar(cr: &cairo::Context, bar: &BarConfig, w: f64, h: f64) {
     cr.restore().ok();
 }
 
+/// A card's preset: built-in (read-only) or the user's own.
+#[derive(Clone)]
+pub enum Choice {
+    Builtin(&'static BarPreset),
+    User(UserPreset),
+}
+
+impl Choice {
+    fn id(&self) -> String {
+        match self {
+            Choice::Builtin(p) => p.id.to_string(),
+            Choice::User(p) => p.id(),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Choice::Builtin(p) => p.name.to_string(),
+            Choice::User(p) => p.name.clone(),
+        }
+    }
+
+    fn apply(&self, bar: &mut BarConfig) {
+        match self {
+            Choice::Builtin(p) => p.apply(bar),
+            Choice::User(p) => p.apply(bar),
+        }
+    }
+
+    fn applied_to(&self, bar: &BarConfig) -> BarConfig {
+        let mut out = bar.clone();
+        self.apply(&mut out);
+        out
+    }
+}
+
+struct Card {
+    choice: Choice,
+    area: gtk::DrawingArea,
+    chip: gtk::Label,
+}
+
+pub struct Presets {
+    flow: gtk::FlowBox,
+    save: gtk::Button,
+    cards: RefCell<Vec<Card>>,
+    /// The user presets on disk (`None`: read again).
+    user: RefCell<Option<Vec<UserPreset>>>,
+    /// The user presets the cards were built for.
+    built_for: RefCell<Option<String>>,
+    /// The saved bar; the previews show each preset applied to it.
+    current: Rc<RefCell<BarConfig>>,
+}
+
 impl Presets {
     pub fn new(page: &adw::PreferencesPage) -> Self {
+        let save = gtk::Button::builder()
+            .label("Save as Preset…")
+            .tooltip_text("Save the current bar look as your own preset")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
         let group = adw::PreferencesGroup::builder()
             .title("Presets")
             .description(
-                "Ready-made looks: colors, sizes and module layout. The program, monitors, \
-                 font family and module settings stay. Previews show the selected program",
+                "Built-in looks set colors, sizes and module layout. Your presets keep \
+                 everything except the program, login start and monitors. Previews show \
+                 the selected program",
             )
+            .header_suffix(&save)
             .build();
         let flow = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -243,99 +302,200 @@ impl Presets {
             .column_spacing(12)
             .row_spacing(12)
             .build();
-        let current = Rc::new(RefCell::new(BarConfig::default()));
-        let mut cards = Vec::new();
-        for p in BAR_PRESETS {
-            let area = gtk::DrawingArea::builder()
-                .content_height(44)
-                .content_width(220)
-                .hexpand(true)
-                .css_classes(["preset-preview"])
-                .build();
-            let cur = current.clone();
-            area.set_draw_func(move |_, cr, w, h| {
-                let (w, h) = (w as f64, h as f64);
-                rounded_rect(cr, 0.0, 0.0, w, h, 10.0);
-                cr.clip();
-                draw_bar(cr, &p.applied_to(&cur.borrow()), w, h);
-            });
-            let bx = gtk::Box::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .spacing(8)
-                .build();
-            bx.append(&area);
-            let top = gtk::Box::builder().spacing(8).build();
-            top.append(
-                &gtk::Label::builder()
-                    .label(p.name)
-                    .xalign(0.0)
-                    .hexpand(true)
-                    .css_classes(["heading"])
-                    .build(),
-            );
-            let chip = gtk::Label::builder()
-                .label("Current")
-                .css_classes(["preset-chip"])
-                .visible(false)
-                .build();
-            top.append(&chip);
-            bx.append(&top);
-            bx.append(
-                &gtk::Label::builder()
-                    .label(p.description)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .lines(3)
-                    .max_width_chars(30)
-                    .css_classes(["dim-label", "caption"])
-                    .build(),
-            );
-            let btn = gtk::Button::builder()
-                .child(&bx)
-                .tooltip_text(format!("Apply {}", p.name))
-                .css_classes(["card", "preset-card"])
-                .build();
-            flow.append(&btn);
-            cards.push((p, btn, area, chip));
-        }
         group.add(&flow);
         page.add(&group);
         Self {
-            cards,
-            current,
-        }
-    }
-
-    /// Redraw the previews for the saved bar and mark the preset in use.
-    pub fn update(&self, bar: &BarConfig) {
-        *self.current.borrow_mut() = bar.clone();
-        for (p, _, area, chip) in &self.cards {
-            chip.set_visible(p.applied_to(bar) == *bar);
-            area.queue_draw();
+            flow,
+            save,
+            cards: RefCell::new(Vec::new()),
+            user: RefCell::new(None),
+            built_for: RefCell::new(None),
+            current: Rc::new(RefCell::new(BarConfig::default())),
         }
     }
 }
 
 impl BarPage {
-    pub(super) fn connect_presets(self: &Rc<Self>) {
-        for (p, btn, _, _) in &self.presets.cards {
-            let (st, p) = (Rc::downgrade(self), *p);
-            btn.connect_clicked(move |_| {
-                if let Some(st) = st.upgrade() {
-                    st.confirm_preset(p);
-                }
-            });
+    /// Build the cards (again when the user presets changed), redraw the
+    /// previews and mark the preset in use ("Current" / "Modified").
+    pub(super) fn load_presets(self: &Rc<Self>, bar: &BarConfig) {
+        *self.presets.current.borrow_mut() = bar.clone();
+        // read once; the preset actions clear it
+        let user = self
+            .presets
+            .user
+            .borrow_mut()
+            .get_or_insert_with(|| list_user_presets(&self.ctx.data_dir))
+            .clone();
+        let sig = serde_json::to_string(
+            &user.iter().map(|p| (&p.slug, p)).collect::<Vec<_>>(),
+        )
+        .unwrap_or_default();
+        if self.presets.built_for.borrow().as_deref() != Some(sig.as_str()) {
+            while let Some(child) = self.presets.flow.first_child() {
+                self.presets.flow.remove(&child);
+            }
+            let mut cards = Vec::new();
+            let choices = BAR_PRESETS
+                .iter()
+                .map(Choice::Builtin)
+                .chain(user.into_iter().map(Choice::User));
+            for choice in choices {
+                cards.push(self.preset_card(choice));
+            }
+            *self.presets.cards.borrow_mut() = cards;
+            *self.presets.built_for.borrow_mut() = Some(sig);
+        }
+        let applied = bar.preset.as_deref();
+        for card in self.presets.cards.borrow().iter() {
+            let id = card.choice.id();
+            let same = card.choice.applied_to(bar) == *bar;
+            let text = match applied {
+                Some(a) if a == id => Some(if same { "Current" } else { "Modified" }),
+                // settings from before presets were remembered
+                None if same => Some("Current"),
+                _ => None,
+            };
+            card.chip.set_visible(text.is_some());
+            card.chip.set_label(text.unwrap_or(""));
+            card.area.queue_draw();
         }
     }
 
-    fn confirm_preset(self: &Rc<Self>, p: &'static BarPreset) {
-        let running = our_bar_running(&self.ctx.data_dir);
+    fn preset_card(self: &Rc<Self>, choice: Choice) -> Card {
+        let area = gtk::DrawingArea::builder()
+            .content_height(44)
+            .content_width(220)
+            .hexpand(true)
+            .css_classes(["preset-preview"])
+            .build();
+        let (cur, draw) = (self.presets.current.clone(), choice.clone());
+        area.set_draw_func(move |_, cr, w, h| {
+            let (w, h) = (w as f64, h as f64);
+            rounded_rect(cr, 0.0, 0.0, w, h, 10.0);
+            cr.clip();
+            draw_bar(cr, &draw.applied_to(&cur.borrow()), w, h);
+        });
+        let bx = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .build();
+        bx.append(&area);
+        let top = gtk::Box::builder().spacing(8).build();
+        top.append(
+            &gtk::Label::builder()
+                .label(choice.name())
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["heading"])
+                .build(),
+        );
+        let chip = gtk::Label::builder()
+            .label("Current")
+            .css_classes(["preset-chip"])
+            .visible(false)
+            .build();
+        top.append(&chip);
+        bx.append(&top);
+        let description = match &choice {
+            Choice::Builtin(p) => p.description.to_string(),
+            Choice::User(_) => "Yours".to_string(),
+        };
+        bx.append(
+            &gtk::Label::builder()
+                .label(description)
+                .xalign(0.0)
+                .wrap(true)
+                .lines(3)
+                .max_width_chars(30)
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+        let btn = gtk::Button::builder()
+            .child(&bx)
+            .tooltip_text(format!("Apply {}", choice.name()))
+            .css_classes(["card", "preset-card"])
+            .build();
+        let st = Rc::downgrade(self);
+        let clicked = choice.clone();
+        btn.connect_clicked(move |_| {
+            if let Some(st) = st.upgrade() {
+                st.confirm_preset(clicked.clone());
+            }
+        });
+        let widget: gtk::Widget = match &choice {
+            Choice::Builtin(_) => btn.upcast(),
+            Choice::User(p) => {
+                // rename / overwrite / delete through the page's "bar" actions
+                let menu = gio::Menu::new();
+                for (label, action) in [
+                    ("Rename…", "bar.preset-rename"),
+                    ("Overwrite with Current Settings", "bar.preset-overwrite"),
+                    ("Delete…", "bar.preset-delete"),
+                ] {
+                    let item = gio::MenuItem::new(Some(label), None);
+                    item.set_action_and_target_value(Some(action), Some(&p.slug.to_variant()));
+                    menu.append_item(&item);
+                }
+                let more = gtk::MenuButton::builder()
+                    .icon_name("view-more-symbolic")
+                    .tooltip_text("Preset options")
+                    .menu_model(&menu)
+                    .halign(gtk::Align::End)
+                    .valign(gtk::Align::End)
+                    .margin_end(6)
+                    .margin_bottom(6)
+                    .css_classes(["flat", "circular"])
+                    .build();
+                let overlay = gtk::Overlay::builder().child(&btn).build();
+                overlay.add_overlay(&more);
+                overlay.upcast()
+            }
+        };
+        self.presets.flow.append(&widget);
+        Card { choice, area, chip }
+    }
+
+    pub(super) fn connect_presets(self: &Rc<Self>) {
+        let st = Rc::downgrade(self);
+        self.presets.save.connect_clicked(move |_| {
+            if let Some(st) = st.upgrade() {
+                st.ask_preset_name(None);
+            }
+        });
+    }
+
+    /// The "bar" action group's preset actions (the card menus).
+    pub(super) fn add_preset_actions(self: &Rc<Self>, group: &gio::SimpleActionGroup) {
+        for name in ["preset-rename", "preset-overwrite", "preset-delete"] {
+            let action = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+            let st = Rc::downgrade(self);
+            action.connect_activate(move |_, arg| {
+                let (Some(st), Some(slug)) = (st.upgrade(), arg.and_then(|v| v.get::<String>()))
+                else {
+                    return;
+                };
+                match name {
+                    "preset-rename" => st.ask_preset_name(Some(slug)),
+                    "preset-overwrite" => st.overwrite_preset(&slug),
+                    _ => st.confirm_delete_preset(&slug),
+                }
+            });
+            group.add_action(&action);
+        }
+    }
+
+    fn confirm_preset(self: &Rc<Self>, choice: Choice) {
+        let replaces = match choice {
+            Choice::Builtin(_) => "the bar's colors, sizes and module layout",
+            Choice::User(_) => "all bar settings except the program, login start and monitors",
+        };
         let dialog = adw::AlertDialog::builder()
-            .heading(format!("Use “{}”?", p.name))
+            .heading(format!("Use “{}”?", choice.name()))
             .body(format!(
-                "This replaces the bar's colors, sizes and module layout, then writes the bar \
-                 files{}.",
-                if running { " and restarts the bar" } else { "" }
+                "This replaces {}, then writes the bar files and updates a running bar.",
+                replaces
             ))
             .default_response("apply")
             .close_response("cancel")
@@ -346,24 +506,133 @@ impl BarPage {
         let st = Rc::downgrade(self);
         dialog.connect_response(Some("apply"), move |_, _| {
             if let Some(st) = st.upgrade() {
-                st.apply_preset(p);
+                st.apply_preset(&choice);
             }
         });
         dialog.present(Some(&self.page));
     }
 
-    /// Save the preset's look, write the files and restart a running bar
-    /// (the Start / Write Files flow).
-    fn apply_preset(self: &Rc<Self>, p: &BarPreset) {
+    /// Copy the preset into the saved settings; the live update writes the
+    /// files and updates a running bar, as for any other change.
+    fn apply_preset(self: &Rc<Self>, choice: &Choice) {
         self.edit(|bar| {
-            p.apply(bar);
+            choice.apply(bar);
+            bar.preset = Some(choice.id());
             Ok(())
         });
-        self.ctx.toast(&format!("Bar preset “{}” saved", p.name));
-        if our_bar_running(&self.ctx.data_dir) {
-            self.start(&[]);
-        } else {
-            self.write_files();
+        let note = self.sync_login(&self.bar()).unwrap_or("");
+        self.ctx
+            .toast(&format!("Bar preset “{}” applied{}", choice.name(), note));
+    }
+
+    /// Name dialog: save a new preset (`slug` None) or rename one.
+    fn ask_preset_name(self: &Rc<Self>, slug: Option<String>) {
+        let old = slug
+            .as_deref()
+            .and_then(|s| find_user_preset(&self.ctx.data_dir, s));
+        let entry = gtk::Entry::builder()
+            .placeholder_text("Name")
+            .activates_default(true)
+            .text(old.as_ref().map(|p| p.name.as_str()).unwrap_or(""))
+            .build();
+        let (heading, ok) = match &old {
+            Some(_) => ("Rename Preset", "Rename"),
+            None => ("Save as Preset", "Save"),
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading(heading)
+            .body(if old.is_some() {
+                ""
+            } else {
+                "Saves everything except the program, login start and monitors."
+            })
+            .extra_child(&entry)
+            .default_response("ok")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("ok", ok);
+        dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+        let st = Rc::downgrade(self);
+        dialog.connect_response(Some("ok"), move |_, _| {
+            let Some(st) = st.upgrade() else {
+                return;
+            };
+            let name = entry.text().to_string();
+            let data_dir = st.ctx.data_dir.clone();
+            st.presets.user.take();
+            let res = match &slug {
+                Some(s) => rename_user_preset(&data_dir, s, &name).map(|_| None),
+                None => save_user_preset(&data_dir, &name, &st.bar()).map(Some),
+            };
+            match res {
+                Ok(Some(p)) => {
+                    // the bar now is this preset
+                    let id = p.id();
+                    st.edit(|bar| {
+                        bar.preset = Some(id);
+                        Ok(())
+                    });
+                    st.ctx.toast(&format!("Preset “{}” saved", p.name));
+                }
+                Ok(None) => st.load(),
+                Err(e) => st.ctx.toast(&format!("{:#}", e)),
+            }
+        });
+        dialog.present(Some(&self.page));
+    }
+
+    fn overwrite_preset(self: &Rc<Self>, slug: &str) {
+        self.presets.user.take();
+        match overwrite_user_preset(&self.ctx.data_dir, slug, &self.bar()) {
+            Ok(p) => {
+                let id = p.id();
+                self.edit(|bar| {
+                    bar.preset = Some(id);
+                    Ok(())
+                });
+                self.ctx
+                    .toast(&format!("Preset “{}” now has the current settings", p.name));
+            }
+            Err(e) => self.ctx.toast(&format!("{:#}", e)),
         }
+    }
+
+    fn confirm_delete_preset(self: &Rc<Self>, slug: &str) {
+        let Some(p) = find_user_preset(&self.ctx.data_dir, slug) else {
+            return;
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading(format!("Delete “{}”?", p.name))
+            .body("The preset is deleted. The current bar settings stay as they are.")
+            .default_response("cancel")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        let st = Rc::downgrade(self);
+        dialog.connect_response(Some("delete"), move |_, _| {
+            let Some(st) = st.upgrade() else {
+                return;
+            };
+            let id = p.id();
+            st.presets.user.take();
+            match delete_user_preset(&st.ctx.data_dir, &id) {
+                Ok(()) => {
+                    if st.bar().preset.as_deref() == Some(id.as_str()) {
+                        st.edit(|bar| {
+                            bar.preset = None;
+                            Ok(())
+                        });
+                    } else {
+                        st.load();
+                    }
+                    st.ctx.toast(&format!("Preset “{}” deleted", p.name));
+                }
+                Err(e) => st.ctx.toast(&format!("{:#}", e)),
+            }
+        });
+        dialog.present(Some(&self.page));
     }
 }

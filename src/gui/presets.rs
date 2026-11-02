@@ -1,5 +1,10 @@
 //! Preset cards. Like `mangowm-mod preset apply`, a preset is applied at once
-//! (together with anything else that is staged).
+//! (together with anything else that is staged). The user's own presets
+//! (`mangowm-mod preset save`) show after the built-in ones.
+
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::gdk::prelude::GdkCairoContextExt;
@@ -7,7 +12,11 @@ use gtk::gdk_pixbuf::Pixbuf;
 use gtk::{gio, glib};
 
 use mangowm_mod::core::schema::find_option;
-use mangowm_mod::presets::{apply_preset, list_presets, Preset};
+use mangowm_mod::presets::user::staged_wallpaper;
+use mangowm_mod::presets::{
+    all_presets, apply_preset, current_preset_id, delete_user_preset, overwrite_user_preset,
+    preset_modified, rename_user_preset, save_user_preset, wallpaper_path, Preset,
+};
 
 use crate::ctx::Ctx;
 use crate::logic::{color_to_rgba, layout_of};
@@ -162,23 +171,83 @@ fn draw_windows(p: &Preset, cr: &gtk::cairo::Context, w: f64, h: f64) {
     }
 }
 
-/// Wallpaper thumbnail with the mock windows on top.
-fn preview(p: &Preset) -> gtk::Widget {
+/// Decoded pixels a worker thread can hand back (a Pixbuf is not Send).
+pub(crate) struct Pixels {
+    bytes: glib::Bytes,
+    alpha: bool,
+    bits: i32,
+    size: (i32, i32),
+    stride: i32,
+}
+
+impl Pixels {
+    pub(crate) fn of(pb: &Pixbuf) -> Self {
+        Self {
+            bytes: pb.read_pixel_bytes(),
+            alpha: pb.has_alpha(),
+            bits: pb.bits_per_sample(),
+            size: (pb.width(), pb.height()),
+            stride: pb.rowstride(),
+        }
+    }
+
+    pub(crate) fn pixbuf(self) -> Pixbuf {
+        Pixbuf::from_bytes(
+            &self.bytes,
+            gtk::gdk_pixbuf::Colorspace::Rgb,
+            self.alpha,
+            self.bits,
+            self.size.0,
+            self.size.1,
+            self.stride,
+        )
+    }
+}
+
+/// Wallpaper thumbnail with the mock windows on top. `wallpaper` is a user
+/// preset's own picture (built-in presets use their bundled thumbnail).
+fn preview(p: &Preset, wallpaper_file: Option<PathBuf>) -> gtk::Widget {
     let area = gtk::DrawingArea::builder()
         .content_height(150)
         .content_width(200)
         .css_classes(["preset-preview"])
         .build();
-    let wallpaper = thumb(&p.id).and_then(|b| {
-        let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_static(b));
-        Pixbuf::from_stream(&stream, gio::Cancellable::NONE).ok()
-    });
+    let wallpaper: Rc<RefCell<Option<Pixbuf>>> = Rc::default();
+    let source = match (p.user, thumb(&p.id), wallpaper_file) {
+        (false, Some(bytes), _) => Some(Ok(bytes)),
+        (true, _, Some(path)) => Some(Err(path)),
+        _ => None,
+    };
+    if let Some(source) = source {
+        // decoded on a worker thread; the mock windows show at once
+        let (area, wallpaper) = (area.clone(), wallpaper.clone());
+        glib::spawn_future_local(async move {
+            let pixels = gio::spawn_blocking(move || {
+                let pb = match source {
+                    Ok(bytes) => {
+                        let stream =
+                            gio::MemoryInputStream::from_bytes(&glib::Bytes::from_static(bytes));
+                        Pixbuf::from_stream(&stream, gio::Cancellable::NONE)
+                    }
+                    Err(path) => Pixbuf::from_file_at_scale(&path, 480, 360, true),
+                };
+                pb.ok().map(|pb| Pixels::of(&pb))
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(px) = pixels {
+                *wallpaper.borrow_mut() = Some(px.pixbuf());
+                area.queue_draw();
+            }
+        });
+    }
     let pr = p.clone();
     area.set_draw_func(move |_, cr, w, h| {
         let (w, h) = (w as f64, h as f64);
         rounded_rect(cr, 0.0, 0.0, w, h, 10.0);
         cr.clip();
-        if let Some(pb) = &wallpaper {
+        if let Some(pb) = &*wallpaper.borrow() {
             // cover: fill the card, crop the overflow evenly
             let (pw, ph) = (pb.width() as f64, pb.height() as f64);
             let k = (w / pw).max(h / ph);
@@ -204,10 +273,14 @@ fn apply(ctx: &Ctx, parent: &gtk::Widget, p: &Preset) {
 }
 
 fn confirm(ctx: &Ctx, parent: &gtk::Widget, p: &Preset) {
+    let what = match (p.user, &p.wallpaper) {
+        (true, None) => "",
+        _ => " plus the wallpaper",
+    };
     let mut body = format!(
-        "This writes {} tiling and look settings plus the wallpaper to mango-mod.conf and \
-         reloads MangoWM now.",
-        p.settings.len()
+        "This writes {} tiling and look settings{} to mango-mod.conf and reloads MangoWM now.",
+        p.settings.len(),
+        what
     );
     if ctx.mgr.borrow().is_dirty() {
         body.push_str(" Your other staged changes are applied too.");
@@ -226,23 +299,198 @@ fn confirm(ctx: &Ctx, parent: &gtk::Widget, p: &Preset) {
     dialog.present(Some(parent));
 }
 
-fn card(ctx: &Ctx, p: &Preset) -> gtk::Widget {
+/// Ask for a preset name; `wallpaper` adds an "Include wallpaper" switch.
+/// `done` gets the name and the switch.
+fn name_dialog(
+    parent: &gtk::Widget,
+    heading: &str,
+    body: &str,
+    action: &str,
+    name: &str,
+    wallpaper: Option<Option<PathBuf>>,
+    done: impl Fn(&str, bool) + 'static,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .default_response("ok")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("ok", action);
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let entry = adw::EntryRow::builder().title("Name").text(name).build();
+    list.append(&entry);
+    let switch = wallpaper.map(|current| {
+        let file = current
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|f| f.to_string_lossy().into_owned());
+        let row = adw::SwitchRow::builder()
+            .title("Include wallpaper")
+            .subtitle(file.as_deref().unwrap_or("No wallpaper set"))
+            .sensitive(file.is_some())
+            .build();
+        list.append(&row);
+        row
+    });
+    dialog.set_extra_child(Some(&list));
+    let empty = |e: &adw::EntryRow| e.text().trim().is_empty();
+    dialog.set_response_enabled("ok", !empty(&entry));
+    let d = dialog.clone();
+    entry.connect_changed(move |e| d.set_response_enabled("ok", !empty(e)));
+    dialog.connect_response(Some("ok"), move |_, _| {
+        done(&entry.text(), switch.as_ref().is_some_and(|s| s.is_active()));
+    });
+    dialog.present(Some(parent));
+}
+
+/// Yes/No for something that can't be undone.
+fn confirm_destructive(
+    parent: &gtk::Widget,
+    heading: &str,
+    body: &str,
+    action: &str,
+    done: impl Fn() + 'static,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .body(body)
+        .default_response("cancel")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("ok", action);
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Destructive);
+    dialog.connect_response(Some("ok"), move |_, _| done());
+    dialog.present(Some(parent));
+}
+
+/// Rename / overwrite / delete for a user preset.
+fn user_menu(page: &Rc<Page>, p: &Preset) -> gtk::MenuButton {
+    let items = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    let popover = gtk::Popover::builder().child(&items).build();
+    let menu = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("More")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "circular"])
+        .popover(&popover)
+        .build();
+    let item = |label: &str, f: Box<dyn Fn(&gtk::Widget)>| {
+        let b = gtk::Button::builder()
+            .label(label)
+            .css_classes(["flat"])
+            .build();
+        if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+            l.set_xalign(0.0);
+        }
+        let (pop, anchor) = (popover.clone(), menu.clone());
+        b.connect_clicked(move |_| {
+            pop.popdown();
+            f(anchor.upcast_ref());
+        });
+        items.append(&b);
+    };
+
+    let (pg, pr) = (page.clone(), p.clone());
+    item(
+        "Rename…",
+        Box::new(move |w| {
+            let pg = pg.clone();
+            let id = pr.id.clone();
+            name_dialog(w, "Rename Preset", "", "Rename", &pr.name, None, move |name, _| {
+                let res = rename_user_preset(&pg.ctx.data_dir, &id, name);
+                pg.done(res.map(|p| format!("Renamed to {}", p.name)));
+            });
+        }),
+    );
+    let (pg, pr) = (page.clone(), p.clone());
+    item(
+        "Overwrite with current settings",
+        Box::new(move |w| {
+            let pg = pg.clone();
+            let id = pr.id.clone();
+            confirm_destructive(
+                w,
+                &format!("Overwrite “{}”?", pr.name),
+                "Its saved values are replaced with your current settings.",
+                "Overwrite",
+                move || {
+                    let res = overwrite_user_preset(&pg.ctx.mgr.borrow(), &id);
+                    pg.done(res.map(|p| format!("Preset {} updated", p.name)));
+                },
+            );
+        }),
+    );
+    let (pg, pr) = (page.clone(), p.clone());
+    item(
+        "Delete…",
+        Box::new(move |w| {
+            let pg = pg.clone();
+            let id = pr.id.clone();
+            confirm_destructive(
+                w,
+                &format!("Delete “{}”?", pr.name),
+                "The preset is removed. Your current settings stay as they are.",
+                "Delete",
+                move || {
+                    let res = delete_user_preset(&pg.ctx.data_dir, &id);
+                    pg.done(res.map(|p| format!("Preset {} deleted", p.name)));
+                },
+            );
+        }),
+    );
+    menu
+}
+
+/// A card and its "Current" / "Modified" mark.
+struct Card {
+    preset: Preset,
+    wallpaper: Option<PathBuf>,
+    status: gtk::Label,
+}
+
+fn card(page: &Rc<Page>, p: &Preset) -> (gtk::Widget, Card) {
+    let wallpaper = wallpaper_path(&page.ctx.data_dir, p);
     let bx = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
         .width_request(240)
         .css_classes(["card", "preset-card"])
         .build();
-    bx.append(&preview(p));
+    bx.append(&preview(p, wallpaper.clone()));
     let top = gtk::Box::builder().spacing(8).build();
     top.append(
         &gtk::Label::builder()
             .label(&p.name)
             .xalign(0.0)
-            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["title-4"])
             .build(),
     );
+    if p.user {
+        top.append(
+            &gtk::Label::builder()
+                .label("yours")
+                .valign(gtk::Align::Center)
+                .tooltip_text("Saved by you")
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+    }
+    top.append(&gtk::Box::builder().hexpand(true).build());
+    let status = gtk::Label::builder()
+        .visible(false)
+        .css_classes(["preset-chip"])
+        .build();
+    top.append(&status);
     if let Some(layout) = p.settings.get("tag_rule").and_then(|v| layout_of(v)) {
         top.append(
             &gtk::Label::builder()
@@ -271,16 +519,98 @@ fn card(ctx: &Ctx, p: &Preset) -> gtk::Widget {
     dots.set_hexpand(true);
     dots.set_valign(gtk::Align::Center);
     bottom.append(&dots);
+    if p.user {
+        bottom.append(&user_menu(page, p));
+    }
     let btn = gtk::Button::builder()
         .label("Apply")
         .tooltip_text(format!("{} settings, applied at once", p.settings.len()))
         .css_classes(["pill", "preset-apply"])
         .build();
-    let (c, pr) = (ctx.clone(), p.clone());
-    btn.connect_clicked(move |b| confirm(&c, b.upcast_ref(), &pr));
+    let (pg, pr) = (page.clone(), p.clone());
+    btn.connect_clicked(move |b| confirm(&pg.ctx, b.upcast_ref(), &pr));
     bottom.append(&btn);
     bx.append(&bottom);
-    bx.upcast()
+    let card = Card {
+        preset: p.clone(),
+        wallpaper,
+        status,
+    };
+    (bx.upcast(), card)
+}
+
+struct Page {
+    ctx: Ctx,
+    flow: gtk::FlowBox,
+    cards: RefCell<Vec<Card>>,
+}
+
+impl Page {
+    /// (Re)build the cards: built-in presets, then the user's.
+    fn fill(self: &Rc<Self>) {
+        while let Some(c) = self.flow.first_child() {
+            self.flow.remove(&c);
+        }
+        let mut cards = Vec::new();
+        for p in all_presets(&self.ctx.data_dir) {
+            let (w, c) = card(self, &p);
+            self.flow.append(&w);
+            cards.push(c);
+        }
+        *self.cards.borrow_mut() = cards;
+        self.refresh();
+    }
+
+    /// Mark the current preset, and whether the settings moved away from it.
+    fn refresh(&self) {
+        let current = current_preset_id(&self.ctx.data_dir);
+        let mgr = self.ctx.mgr.borrow();
+        for c in self.cards.borrow().iter() {
+            let is_current = current.as_deref() == Some(c.preset.id.as_str());
+            c.status.set_visible(is_current);
+            if !is_current {
+                continue;
+            }
+            let modified = preset_modified(&mgr, &c.preset, c.wallpaper.as_deref());
+            c.status.set_label(if modified { "Modified" } else { "Current" });
+            c.status.set_tooltip_text(Some(if modified {
+                "Your settings differ from this preset"
+            } else {
+                "Your settings match this preset"
+            }));
+            if modified {
+                c.status.add_css_class("dim-label");
+            } else {
+                c.status.remove_css_class("dim-label");
+            }
+        }
+    }
+
+    /// After a save, rename, overwrite or delete: toast and rebuild the cards.
+    fn done(self: &Rc<Self>, res: anyhow::Result<String>) {
+        match res {
+            Ok(msg) => self.ctx.toast(&msg),
+            Err(e) => self.ctx.toast(&format!("{:#}", e)),
+        }
+        self.fill();
+    }
+
+    fn save_dialog(self: &Rc<Self>, parent: &gtk::Widget) {
+        let current = staged_wallpaper(&self.ctx.mgr.borrow()).filter(|p| p.is_file());
+        let pg = self.clone();
+        name_dialog(
+            parent,
+            "Save as Preset",
+            "Saves your current tiling, gap, border and color settings as your own preset.",
+            "Save",
+            "",
+            Some(current),
+            move |name, wallpaper| {
+                let res = save_user_preset(&pg.ctx.mgr.borrow(), name, wallpaper);
+                pg.done(res.map(|p| format!("Saved preset {}", p.name)));
+            },
+        );
+    }
 }
 
 pub fn page(ctx: &Ctx) -> gtk::Widget {
@@ -293,26 +623,43 @@ pub fn page(ctx: &Ctx) -> gtk::Widget {
         .row_spacing(12)
         .valign(gtk::Align::Start)
         .build();
-    for p in list_presets() {
-        flow.append(&card(ctx, &p));
-    }
+    let page = Rc::new(Page {
+        ctx: ctx.clone(),
+        flow: flow.clone(),
+        cards: RefCell::default(),
+    });
+    page.fill();
+    let pg = page.clone();
+    ctx.on_change(move || pg.refresh());
+
     let col = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
         .build();
-    col.append(
+    let head = gtk::Box::builder().spacing(12).build();
+    head.append(
         &gtk::Label::builder()
             .label("Ready-made looks. A preset is written and reloaded right away; a backup is made first.")
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .css_classes(["dim-label"])
             .build(),
     );
+    let save = gtk::Button::builder()
+        .label("Save current settings as preset…")
+        .valign(gtk::Align::Center)
+        .build();
+    let pg = page.clone();
+    save.connect_clicked(move |b| pg.save_dialog(b.upcast_ref()));
+    head.append(&save);
+    col.append(&head);
     col.append(&flow);
     let clamp = adw::Clamp::builder()
         .maximum_size(980)
         .margin_top(24)
-        .margin_bottom(24)
+        // room for the floating apply bar under the last row
+        .margin_bottom(88)
         .margin_start(12)
         .margin_end(12)
         .child(&col)

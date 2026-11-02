@@ -20,7 +20,7 @@ pub const DISABLED_NOTE: &str = "# disabled by MangoWM Mod: its bar starts from 
 
 /// The CLI binary: `$PATH` first, else next to the running program (the GUI
 /// is installed beside it), else the bare name.
-fn cli_binary() -> PathBuf {
+pub(crate) fn cli_binary() -> PathBuf {
     if let Some(p) = find_in_path(CLI_NAME) {
         return p;
     }
@@ -31,7 +31,7 @@ fn cli_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(CLI_NAME))
 }
 
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     if !text.is_empty()
         && text
             .chars()

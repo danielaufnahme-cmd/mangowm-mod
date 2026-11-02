@@ -4,6 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, SystemTime};
 
 use adw::prelude::*;
 use gtk::glib::{self, clone};
@@ -13,19 +14,26 @@ use mangowm_mod::bar::login::{
     disable_unmanaged_bars, login_state, set_login_start, unmanaged_bar_lines, LoginState,
 };
 use mangowm_mod::bar::model::{
-    line_height, Backend, BarConfig, FONT_WEIGHTS, KNOWN_MODULES, LAYERS, POSITIONS, TEXT_INSET,
+    line_height, Backend, BarConfig, BAR_FIELDS, FONT_SIZE_RANGE, FONT_WEIGHTS, KNOWN_MODULES, LAYERS, POSITIONS, TEXT_INSET,
 };
 use mangowm_mod::bar::options::find_opt;
-use mangowm_mod::bar::process::{foreign_bars, start_bar, stop_bar, stop_foreign, ForeignBar};
+use mangowm_mod::bar::process::{
+    foreign_bars, start_bar, stop_bar, stop_foreign, update_live, ForeignBar,
+};
 
 use crate::ctx::Ctx;
 use crate::logic::{color_to_rgba, rgba_to_hex};
 use crate::rows::{color_button, from_gdk, to_gdk};
 
+#[path = "bar_buttons.rs"]
+mod bar_buttons;
 #[path = "bar_modules.rs"]
 mod bar_modules;
 #[path = "bar_presets.rs"]
 mod bar_presets;
+
+/// Quiet time after the last edit before the running bar is updated.
+const LIVE_DELAY: Duration = Duration::from_millis(400);
 
 type Getter = fn(&BarConfig) -> f64;
 type ColorGetter = fn(&BarConfig) -> &str;
@@ -57,70 +65,181 @@ pub(crate) struct BarPage {
     migrate_row: adw::ActionRow,
     presets: bar_presets::Presets,
     modules: bar_modules::Modules,
+    buttons: bar_buttons::Buttons,
     extra: adw::PreferencesGroup,
     extra_rows: RefCell<Vec<gtk::Widget>>,
     files: adw::ActionRow,
     notes: adw::PreferencesGroup,
     note_rows: RefCell<Vec<gtk::Widget>>,
+    /// The settings (bar.json is saved [`LIVE_DELAY`] after a change).
+    model: RefCell<BarConfig>,
+    /// A change is not saved yet.
+    dirty: Cell<bool>,
+    /// bar.json's time when it was last read or written.
+    disk_mtime: Cell<Option<SystemTime>>,
+    /// Pending live update (see [`BarPage::schedule_live`]).
+    live_timer: RefCell<Option<glib::SourceId>>,
+    live_busy: Cell<bool>,
 }
 
 impl BarPage {
+    /// The settings in memory; re-read when bar.json was changed by someone
+    /// else (the Wallpaper page, the CLI) and nothing is waiting to be saved.
     fn bar(&self) -> BarConfig {
-        match BarConfig::load(&self.path) {
+        self.sync_from_disk();
+        self.model.borrow().clone()
+    }
+
+    fn sync_from_disk(&self) {
+        if self.dirty.get() {
+            return;
+        }
+        let mtime = file_mtime(&self.path);
+        if self.disk_mtime.get() == mtime && self.disk_mtime.get().is_some() {
+            return;
+        }
+        let bar = match BarConfig::load(&self.path) {
             Ok(b) => b,
             Err(e) => {
                 self.ctx.toast(&format!("{:#}", e));
                 BarConfig::default()
             }
+        };
+        *self.model.borrow_mut() = bar;
+        self.disk_mtime.set(mtime);
+    }
+
+    /// Keep `bar` as the settings; bar.json is written with the live update.
+    fn commit(self: &Rc<Self>, bar: BarConfig) {
+        *self.model.borrow_mut() = bar;
+        self.dirty.set(true);
+        self.schedule_live();
+    }
+
+    /// Write bar.json now if a change is waiting.
+    fn flush_save(&self) {
+        if !self.dirty.get() {
+            return;
+        }
+        match self.model.borrow().save(&self.path) {
+            Ok(()) => {
+                self.dirty.set(false);
+                self.disk_mtime.set(file_mtime(&self.path));
+            }
+            Err(e) => self.ctx.toast(&format!("Bar: {:#}", e)),
         }
     }
 
-    /// `mangowm-mod bar set KEY VALUE`; the widgets re-read the saved file.
+    /// `mangowm-mod bar set KEY VALUE`. Only the rows that depend on the
+    /// change are refreshed; module and program changes rebuild the lists.
     fn set(self: &Rc<Self>, key: &str, value: &str) {
         if self.updating.get() {
             return;
         }
-        let res = BarConfig::load(&self.path).and_then(|mut bar| {
-            bar.set(key, value)?;
-            bar.save(&self.path)
-        });
-        if let Err(e) = res {
+        let mut bar = self.bar();
+        if let Err(e) = bar.set(key, value) {
             self.ctx.toast(&format!("Bar: {:#}", e));
+            // show the saved value again
+            self.refresh();
+            return;
         }
-        self.load();
+        self.commit(bar);
+        match key {
+            "backend" | "waybar-mango-modules" | "memory-display" | "left" | "center" | "right" => {
+                self.load()
+            }
+            _ if !BAR_FIELDS.contains(&key) => {
+                self.refresh();
+                self.load_lists(&self.bar());
+            }
+            _ => self.refresh(),
+        }
     }
 
     /// `mangowm-mod bar unset KEY`.
     fn unset(self: &Rc<Self>, key: &str) {
-        let res = BarConfig::load(&self.path).and_then(|mut bar| {
-            if bar.unset(key) {
-                bar.save(&self.path)?;
-            }
-            Ok(())
-        });
-        if let Err(e) = res {
-            self.ctx.toast(&format!("Bar: {:#}", e));
+        let mut bar = self.bar();
+        if bar.unset(key) {
+            self.commit(bar);
         }
         // show the default again in the module settings
         self.modules.built_for.borrow_mut().clear();
         self.load();
     }
 
-    /// Change the saved settings with `f` (validated), then reload the page.
+    /// Change the settings with `f` (validated), then reload the page.
     fn edit(self: &Rc<Self>, f: impl FnOnce(&mut BarConfig) -> anyhow::Result<()>) {
-        let res = BarConfig::load(&self.path).and_then(|mut bar| {
-            f(&mut bar)?;
-            bar.validate()?;
-            bar.save(&self.path)
-        });
-        if let Err(e) = res {
-            self.ctx.toast(&format!("Bar: {:#}", e));
+        let mut bar = self.bar();
+        match f(&mut bar).and_then(|_| bar.validate()) {
+            Ok(()) => self.commit(bar),
+            Err(e) => self.ctx.toast(&format!("Bar: {:#}", e)),
         }
         self.load();
     }
 
+    /// Update the running bar [`LIVE_DELAY`] after the last change: write
+    /// the files, then reload Waybar or restart Mangobar if our bar runs.
+    fn schedule_live(self: &Rc<Self>) {
+        if let Some(id) = self.live_timer.take() {
+            id.remove();
+        }
+        let st = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(LIVE_DELAY, move || {
+            if let Some(st) = st.upgrade() {
+                // fired: the id must not be removed any more
+                st.live_timer.take();
+                st.flush_save();
+                st.run_live();
+            }
+        });
+        *self.live_timer.borrow_mut() = Some(id);
+    }
+
+    fn run_live(self: &Rc<Self>) {
+        if self.live_busy.get() {
+            self.schedule_live();
+            return;
+        }
+        self.live_busy.set(true);
+        let bar = self.bar();
+        let data_dir = self.ctx.data_dir.clone();
+        // the offscreen screenshot mode never touches the real bar
+        let restart = std::env::var("GDK_BACKEND").as_deref() != Ok("broadway");
+        let st = self.clone();
+        glib::spawn_future_local(async move {
+            // a Mangobar restart waits for the new bar: off the UI thread
+            let res =
+                gtk::gio::spawn_blocking(move || update_live(&bar, &data_dir, restart)).await;
+            st.live_busy.set(false);
+            match res {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => st.ctx.toast(&format!("Bar: {:#}", e)),
+                Err(_) => st.ctx.toast("Bar: the live update failed"),
+            }
+        });
+    }
+
+    /// Every part of the page from the settings.
     fn load(self: &Rc<Self>) {
         let bar = self.bar();
+        self.load_rows(&bar);
+        self.load_presets(&bar);
+        self.load_login(&bar);
+        self.load_modules(&bar);
+        self.load_buttons(&bar);
+        self.load_lists(&bar);
+    }
+
+    /// After a simple change: the rows, preset marks and notes.
+    fn refresh(self: &Rc<Self>) {
+        let bar = self.bar();
+        self.load_rows(&bar);
+        self.load_presets(&bar);
+        self.load_notes(&bar);
+    }
+
+    /// The setting rows (values, dependent subtitles) without rebuilding.
+    fn load_rows(&self, bar: &BarConfig) {
         let waybar = bar.backend == Backend::Waybar;
         self.updating.set(true);
         self.backend.set_selected(if waybar { 1 } else { 0 });
@@ -139,7 +258,7 @@ impl BarPage {
         }
         self.mango_modules.set_active(bar.waybar_mango_modules);
         for (key, row, get) in &self.spins {
-            row.set_value(get(&bar));
+            row.set_value(get(bar));
             match *key {
                 "height" => {
                     row.set_sensitive(!bar.auto_height);
@@ -178,7 +297,7 @@ impl BarPage {
                 .unwrap_or(0) as u32,
         );
         for (_, btn, get) in &self.colors {
-            if let Some(rgba) = color_to_rgba(get(&bar)) {
+            if let Some(rgba) = color_to_rgba(get(bar)) {
                 btn.set_rgba(&to_gdk(rgba));
             }
         }
@@ -198,10 +317,6 @@ impl BarPage {
         self.updating.set(false);
         self.files
             .set_subtitle(&bar_dir(bar.backend).display().to_string());
-        self.presets.update(&bar);
-        self.load_login(&bar);
-        self.load_modules(&bar);
-        self.load_lists(&bar);
     }
 
     /// Login switch subtitle and the "config.conf starts another bar" note.
@@ -257,8 +372,8 @@ impl BarPage {
         self.load();
     }
 
-    /// Top-level options and module options the page has no row for, plus
-    /// the backend warnings.
+    /// Top-level options and module options the page has no row for, then
+    /// the notes.
     fn load_lists(&self, bar: &BarConfig) {
         for r in self.extra_rows.borrow_mut().drain(..) {
             self.extra.remove(&r);
@@ -296,7 +411,11 @@ impl BarPage {
             rows.push(row.upcast());
         }
         *self.extra_rows.borrow_mut() = rows;
+        self.load_notes(bar);
+    }
 
+    /// The backend warnings.
+    fn load_notes(&self, bar: &BarConfig) {
         for r in self.note_rows.borrow_mut().drain(..) {
             self.notes.remove(&r);
         }
@@ -328,6 +447,7 @@ impl BarPage {
     }
 
     fn write_files(self: &Rc<Self>) {
+        self.flush_save();
         let bar = self.bar();
         match write_bar_files(&bar, None::<&std::path::Path>) {
             Ok(dir) => {
@@ -346,73 +466,101 @@ impl BarPage {
 
     /// Start, after asking to stop a Waybar/Mangobar we did not start.
     fn ask_start(self: &Rc<Self>) {
+        self.flush_save();
         let bar = self.bar();
-        let others = foreign_bars(&bar, &self.ctx.data_dir);
-        if others.is_empty() {
-            self.start(&[]);
-            return;
-        }
-        let list = others
-            .iter()
-            .map(|b| format!("{} (PID {})", b.binary, b.pid))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let dialog = adw::AlertDialog::builder()
-            .heading("Stop the Other Bar?")
-            .body(format!(
-                "{} is running but was not started by MangoWM Mod. Stop it, so only this \
-                 bar is shown?",
-                list
-            ))
-            .default_response("stop")
-            .close_response("cancel")
-            .build();
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("both", "Keep Both");
-        dialog.add_response("stop", "Stop and Start");
-        dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+        let data_dir = self.ctx.data_dir.clone();
         let st = self.clone();
-        dialog.connect_response(None, move |_, resp| match resp {
-            "stop" => st.start(&others),
-            "both" => st.start(&[]),
-            _ => {}
-        });
-        dialog.present(Some(&self.page));
-    }
-
-    fn start(self: &Rc<Self>, stop_first: &[ForeignBar]) {
-        let bar = self.bar();
-        if !stop_first.is_empty() {
-            if let Err(e) = stop_foreign(stop_first) {
-                self.ctx.toast(&format!("{:#}", e));
+        // scans /proc: off the UI thread
+        glib::spawn_future_local(async move {
+            let others = gtk::gio::spawn_blocking(move || foreign_bars(&bar, &data_dir))
+                .await
+                .unwrap_or_default();
+            if others.is_empty() {
+                st.start(Vec::new());
                 return;
             }
-        }
-        let res = write_bar_files(&bar, None::<&std::path::Path>)
-            .and_then(|dir| start_bar(&bar, Some(&dir), &self.ctx.data_dir));
-        match res {
-            Ok(pid) => {
-                let note = self.sync_login(&bar).unwrap_or("");
-                self.ctx.toast(&format!(
-                    "{} started (PID {}){}",
-                    bar.backend.binary(),
-                    pid,
-                    note
+            let list = others
+                .iter()
+                .map(|b| format!("{} (PID {})", b.binary, b.pid))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let dialog = adw::AlertDialog::builder()
+                .heading("Stop the Other Bar?")
+                .body(format!(
+                    "{} is running but was not started by MangoWM Mod. Stop it, so only this \
+                     bar is shown?",
+                    list
                 ))
-            }
-            Err(e) => self.ctx.toast(&format!("{:#}", e)),
-        }
-        self.load();
+                .default_response("stop")
+                .close_response("cancel")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("both", "Keep Both");
+            dialog.add_response("stop", "Stop and Start");
+            dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+            let st2 = st.clone();
+            dialog.connect_response(None, move |_, resp| match resp {
+                "stop" => st2.start(others.clone()),
+                "both" => st2.start(Vec::new()),
+                _ => {}
+            });
+            dialog.present(Some(&st.page));
+        });
     }
 
-    fn stop(&self) {
+    /// Write the files and (re)start the bar in a worker thread.
+    fn start(self: &Rc<Self>, stop_first: Vec<ForeignBar>) {
+        self.flush_save();
         let bar = self.bar();
-        match stop_bar(&bar, None, &self.ctx.data_dir) {
-            Ok(Some(msg)) => self.ctx.toast(&msg),
-            Ok(None) => self.ctx.toast("No bar started by mangowm-mod is running"),
-            Err(e) => self.ctx.toast(&format!("{:#}", e)),
-        }
+        let data_dir = self.ctx.data_dir.clone();
+        let st = self.clone();
+        glib::spawn_future_local(async move {
+            let job = bar.clone();
+            let res = gtk::gio::spawn_blocking(move || -> anyhow::Result<u32> {
+                if !stop_first.is_empty() {
+                    stop_foreign(&stop_first)?;
+                }
+                let dir = write_bar_files(&job, None::<&std::path::Path>)?;
+                start_bar(&job, Some(&dir), &data_dir)
+            })
+            .await;
+            match res {
+                Ok(Ok(pid)) => {
+                    let note = st.sync_login(&bar).unwrap_or("");
+                    st.ctx.toast(&format!(
+                        "{} started (PID {}){}",
+                        bar.backend.binary(),
+                        pid,
+                        note
+                    ))
+                }
+                Ok(Err(e)) => st.ctx.toast(&format!("{:#}", e)),
+                Err(_) => st.ctx.toast("Bar: starting failed"),
+            }
+            st.load();
+        });
     }
+
+    fn stop(self: &Rc<Self>) {
+        let bar = self.bar();
+        let data_dir = self.ctx.data_dir.clone();
+        let st = self.clone();
+        // waits up to 3 s for the bar to exit: off the UI thread
+        glib::spawn_future_local(async move {
+            let res = gtk::gio::spawn_blocking(move || stop_bar(&bar, None, &data_dir)).await;
+            match res {
+                Ok(Ok(Some(msg))) => st.ctx.toast(&msg),
+                Ok(Ok(None)) => st.ctx.toast("No bar started by mangowm-mod is running"),
+                Ok(Err(e)) => st.ctx.toast(&format!("{:#}", e)),
+                Err(_) => st.ctx.toast("Bar: stopping failed"),
+            }
+        });
+    }
+}
+
+
+fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 fn spin(title: &str, lo: f64, hi: f64) -> adw::SpinRow {
@@ -518,16 +666,16 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
     size.add(&auto_height);
     let mut spins: Vec<(&'static str, adw::SpinRow, Getter)> = Vec::new();
     let size_rows: [(&'static str, &str, f64, f64, Getter, bool); 10] = [
-        ("height", "Height", 1.0, 500.0, |b| b.effective_height() as f64, false),
-        ("margin-top", "Top margin", 0.0, 200.0, |b| b.margin_top as f64, false),
-        ("margin-bottom", "Bottom margin", 0.0, 200.0, |b| b.margin_bottom as f64, true),
-        ("margin-left", "Left margin", 0.0, 500.0, |b| b.margin_left as f64, false),
-        ("margin-right", "Right margin", 0.0, 500.0, |b| b.margin_right as f64, false),
-        ("spacing", "Space between modules", 0.0, 100.0, |b| b.spacing as f64, true),
-        ("module-padding", "Module padding", 0.0, 100.0, |b| b.module_padding as f64, false),
-        ("module-margin", "Module top/bottom margin", 0.0, 100.0, |b| b.module_margin as f64, false),
-        ("module-gap", "Module side margin", 0.0, 100.0, |b| b.module_gap as f64, false),
-        ("title-length", "Window title max length (characters, 0 = no limit)", 0.0, 500.0,
+        ("height", "Height", 16.0, 160.0, |b| b.effective_height() as f64, false),
+        ("margin-top", "Top margin", 0.0, 100.0, |b| b.margin_top as f64, false),
+        ("margin-bottom", "Bottom margin", 0.0, 100.0, |b| b.margin_bottom as f64, true),
+        ("margin-left", "Left margin", 0.0, 1000.0, |b| b.margin_left as f64, false),
+        ("margin-right", "Right margin", 0.0, 1000.0, |b| b.margin_right as f64, false),
+        ("spacing", "Space between modules", 0.0, 50.0, |b| b.spacing as f64, true),
+        ("module-padding", "Module padding", 0.0, 60.0, |b| b.module_padding as f64, false),
+        ("module-margin", "Module top/bottom margin", 0.0, 30.0, |b| b.module_margin as f64, false),
+        ("module-gap", "Module side margin", 0.0, 40.0, |b| b.module_gap as f64, false),
+        ("title-length", "Window title max length (characters, 0 = no limit)", 0.0, 300.0,
             |b| b.title_length as f64, false),
     ];
     for (key, title, lo, hi, get, wb) in size_rows {
@@ -545,7 +693,11 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         .title("Font families (Mangobar uses one: a Nerd Font in the list, else the first)")
         .show_apply_button(true)
         .build();
-    let font_size = spin("Font size", 1.0, 200.0);
+    let font_size = spin(
+        "Font size",
+        FONT_SIZE_RANGE.0 as f64,
+        FONT_SIZE_RANGE.1 as f64,
+    );
     let weight = adw::ComboRow::builder()
         .title("Font weight")
         .model(&gtk::StringList::new(&["Normal", "Medium", "Semibold", "Bold"]))
@@ -581,13 +733,13 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         }
         colors.push((key, btn, get));
     }
-    let border_width = spin("Border width", 0.0, 20.0);
+    let border_width = spin("Border width", 0.0, 10.0);
     look.add(&border_width);
     waybar_only.push(border_width.clone().upcast());
     spins.push(("border-width", border_width, |b| b.border_width as f64));
-    let radius = spin("Bar corner radius", 0.0, 200.0);
+    let radius = spin("Bar corner radius", 0.0, 100.0);
     let radius_pill = adw::SwitchRow::builder().title("Pill-shaped bar").build();
-    let module_radius = spin("Module corner radius", 0.0, 200.0);
+    let module_radius = spin("Module corner radius", 0.0, 100.0);
     let module_pill = adw::SwitchRow::builder()
         .title("Pill-shaped modules")
         .build();
@@ -603,6 +755,7 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
     page.add(&look);
 
     let modules = bar_modules::Modules::new(&page);
+    let custom_buttons = bar_buttons::Buttons::new(&page);
 
     let extra = adw::PreferencesGroup::builder()
         .title("Extra Options")
@@ -695,11 +848,17 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         migrate_row,
         presets,
         modules,
+        buttons: custom_buttons,
         extra,
         extra_rows: RefCell::new(Vec::new()),
         files,
         notes,
         note_rows: RefCell::new(Vec::new()),
+        model: RefCell::new(BarConfig::default()),
+        dirty: Cell::new(false),
+        disk_mtime: Cell::new(None),
+        live_timer: RefCell::new(None),
+        live_busy: Cell::new(false),
     });
 
     st.backend.connect_selected_notify(clone!(
@@ -726,7 +885,7 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
             if st.ctx.stage(|m| set_login_start(m, on)) == Some(true) {
                 st.ctx.toast("Staged: press Apply to write mango-mod.conf");
             }
-            st.load();
+            st.load_login(&st.bar());
         }
     ));
     st.layer.connect_selected_notify(clone!(
@@ -800,6 +959,7 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         move |r| st.set("tag-fill", &r.is_active().to_string())
     ));
     st.connect_presets();
+    st.connect_buttons();
     st.mango_modules.connect_active_notify(clone!(
         #[weak]
         st,
@@ -847,6 +1007,12 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         st,
         move |_| st.stop()
     ));
+    // a change still waiting for its save when the window goes
+    page.connect_destroy(clone!(
+        #[weak]
+        st,
+        move |_| st.flush_save()
+    ));
     // Apply / Discard / restore change the login state
     ctx.on_change(clone!(
         #[weak]
@@ -867,8 +1033,9 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         }
     });
     group.add_action(&unset);
+    st.add_preset_actions(&group);
     page.insert_action_group("bar", Some(&group));
 
-    st.load();
+    crate::ctx::timed("bar page load", || st.load());
     page
 }

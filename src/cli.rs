@@ -5,6 +5,7 @@ use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
 use std::path::{Path, PathBuf};
 
+use crate::bar::buttons::{import_picture, run_click, BarButton, Click, ClickAction, Tools};
 use crate::bar::generate::{bar_dir, warnings, waybar_module_name, write_bar_files};
 use crate::bar::model::{Backend, BarConfig, KNOWN_MODULES};
 use crate::bar::login::{
@@ -15,7 +16,10 @@ use crate::core::actions::get_actions;
 use crate::core::items::{Bind, Monitor, Rule};
 use crate::core::manager::{detect_data_dir, ApplyResult, ConfigManager};
 use crate::core::schema::{get_schema_pages, search_options, OptionItem};
-use crate::presets::{apply_preset, find_preset, list_presets};
+use crate::presets::{
+    all_presets, apply_preset, current_preset_id, delete_user_preset, find_any_preset,
+    overwrite_user_preset, rename_user_preset, save_user_preset,
+};
 use crate::palette::{
     apply_bar_colors, palette_from_file, restart_bar_if_running, stage_window_colors, window_colors,
 };
@@ -91,7 +95,7 @@ pub enum Commands {
         search: Option<String>,
     },
 
-    #[command(about = "List and apply presets")]
+    #[command(about = "List, apply and save presets")]
     Preset {
         #[command(subcommand)]
         action: PresetCommands,
@@ -153,6 +157,22 @@ pub enum PresetCommands {
 
     #[command(about = "Apply a preset by ID or name (applies at once)")]
     Apply { name: String },
+
+    #[command(about = "Save the current settings as your own preset")]
+    Save {
+        name: String,
+        #[arg(long, help = "Include the current wallpaper")]
+        wallpaper: bool,
+    },
+
+    #[command(about = "Overwrite your preset with the current settings")]
+    Update { name: String },
+
+    #[command(about = "Rename your preset")]
+    Rename { name: String, new_name: String },
+
+    #[command(about = "Delete your preset (built-in presets can't be deleted)")]
+    Delete { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -406,6 +426,52 @@ pub enum BarCommands {
 
     #[command(about = "List the bar modules")]
     Modules,
+
+    #[command(about = "Custom bar buttons: an emoji or picture that plays a sound, runs a command or opens an app")]
+    Button {
+        #[command(subcommand)]
+        action: ButtonCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ButtonCommands {
+    #[command(about = "List the custom buttons")]
+    List,
+
+    #[command(about = "Add a button (run `bar generate` or `bar start` to show it)")]
+    Add {
+        #[arg(long, help = "Emoji shown in the bar")]
+        emoji: Option<String>,
+        #[arg(long, help = "Picture shown in the bar (Waybar only; copied to the data dir)")]
+        picture: Option<PathBuf>,
+        #[arg(long, help = "Tooltip (Waybar); the text when there is no icon")]
+        label: Option<String>,
+        #[arg(long, default_value = "right", help = "left, center or right")]
+        section: String,
+        #[arg(long, help = "Left click: audio file to play")]
+        sound: Option<String>,
+        #[arg(long, help = "Left click: shell command")]
+        command: Option<String>,
+        #[arg(long, help = "Left click: app desktop id, e.g. firefox.desktop")]
+        app: Option<String>,
+        #[arg(long, help = "Right click: audio file (any right-* flag gives right click its own action)")]
+        right_sound: Option<String>,
+        #[arg(long, help = "Right click: shell command")]
+        right_command: Option<String>,
+        #[arg(long, help = "Right click: app desktop id")]
+        right_app: Option<String>,
+    },
+
+    #[command(about = "Remove a button")]
+    Remove { id: String },
+
+    #[command(about = "Run a button's click action (what the bar calls)")]
+    Run {
+        id: String,
+        #[arg(value_enum)]
+        click: Click,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -586,6 +652,95 @@ fn run_bar(action: BarCommands, data_dir: &Path) -> Result<()> {
             }
             println!("  Also: clock#date, clock#time, battery#<device>, custom/<name>");
             println!("  Waybar without mango/* modules: workspaces -> ext/workspaces, window -> custom/mango-window; layout, keymode and keyboardlayout are left out");
+        }
+
+        BarCommands::Button { action } => run_bar_button(action, data_dir)?,
+    }
+    Ok(())
+}
+
+fn run_bar_button(action: ButtonCommands, data_dir: &Path) -> Result<()> {
+    match action {
+        ButtonCommands::Run { id, click } => {
+            let (bar, _) = load_bar(data_dir)?;
+            let button = bar
+                .button(&id)
+                .ok_or_else(|| anyhow!("no bar button {:?}", id))?;
+            run_click(button, click, &Tools::detect())?;
+        }
+        ButtonCommands::List => {
+            let (bar, _) = load_bar(data_dir)?;
+            if bar.buttons.is_empty() {
+                println!("No custom buttons.");
+            }
+            for b in &bar.buttons {
+                let place = bar.button_section(&b.id).unwrap_or("not in the bar");
+                let right = if b.right_same {
+                    "same as left".to_string()
+                } else {
+                    b.right.summary()
+                };
+                println!(
+                    "  {:<4} {:<6} {:<10} left: {}; right: {}{}",
+                    b.id.cyan(),
+                    b.text(),
+                    place,
+                    b.left.summary(),
+                    right,
+                    if b.picture.is_empty() { "" } else { " (picture)" }
+                );
+            }
+        }
+        ButtonCommands::Add {
+            emoji,
+            picture,
+            label,
+            section,
+            sound,
+            command,
+            app,
+            right_sound,
+            right_command,
+            right_app,
+        } => {
+            let (mut bar, path) = load_bar(data_dir)?;
+            let right = ClickAction {
+                sound: right_sound.unwrap_or_default(),
+                command: right_command.unwrap_or_default(),
+                app: right_app.unwrap_or_default(),
+            };
+            let button = BarButton {
+                id: String::new(),
+                emoji: emoji.unwrap_or_default(),
+                picture: String::new(),
+                label: label.unwrap_or_default(),
+                left: ClickAction {
+                    sound: sound.unwrap_or_default(),
+                    command: command.unwrap_or_default(),
+                    app: app.unwrap_or_default(),
+                },
+                right_same: right.is_empty(),
+                right,
+            };
+            let id = bar.add_button(button, &section)?;
+            if let Some(p) = picture {
+                let copy = import_picture(data_dir, &id, &p)?;
+                if let Some(b) = bar.button_mut(&id) {
+                    b.picture = copy.display().to_string();
+                }
+            }
+            bar.validate()?;
+            bar.save(&path)?;
+            println!("Added button {} ({} section)", id.green(), section);
+            print_bar_warnings(&bar);
+        }
+        ButtonCommands::Remove { id } => {
+            let (mut bar, path) = load_bar(data_dir)?;
+            if !bar.remove_button(&id) {
+                bail!("no bar button {:?}", id);
+            }
+            bar.save(&path)?;
+            println!("Removed button {}", id.yellow());
         }
     }
     Ok(())
@@ -778,8 +933,16 @@ pub fn run_cli(cli: Cli) -> Result<()> {
         Commands::Preset { action } => match action {
             PresetCommands::List => {
                 println!("{}", "Available presets:".bold().cyan());
-                for p in list_presets() {
-                    println!("  - {:<16} {}", p.id.yellow(), p.name.bold());
+                let current = current_preset_id(&mgr.data_dir);
+                for p in all_presets(&mgr.data_dir) {
+                    let mut marks = String::new();
+                    if p.user {
+                        marks.push_str(" (yours)");
+                    }
+                    if current.as_deref() == Some(p.id.as_str()) {
+                        marks.push_str(" (current)");
+                    }
+                    println!("  - {:<16} {}{}", p.id.yellow(), p.name.bold(), marks.dimmed());
                     if !p.description.is_empty() {
                         println!("    {}", p.description.dimmed());
                     }
@@ -787,13 +950,33 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             }
 
             PresetCommands::Apply { name } => {
-                let preset =
-                    find_preset(&name).ok_or_else(|| anyhow!("preset {:?} not found", name))?;
+                let preset = find_any_preset(&mgr.data_dir, &name)
+                    .ok_or_else(|| anyhow!("preset {:?} not found", name))?;
                 let res = apply_preset(&mut mgr, &preset)?;
                 println!("Preset: {}", preset.name.green().bold());
                 if !print_apply(&res) {
                     std::process::exit(1);
                 }
+            }
+
+            PresetCommands::Save { name, wallpaper } => {
+                let p = save_user_preset(&mgr, &name, wallpaper)?;
+                println!("Saved preset {} ({})", p.name.green().bold(), p.id.yellow());
+            }
+
+            PresetCommands::Update { name } => {
+                let p = overwrite_user_preset(&mgr, &name)?;
+                println!("Updated preset {}", p.name.green().bold());
+            }
+
+            PresetCommands::Rename { name, new_name } => {
+                let p = rename_user_preset(&mgr.data_dir, &name, &new_name)?;
+                println!("Renamed to {}", p.name.green().bold());
+            }
+
+            PresetCommands::Delete { name } => {
+                let p = delete_user_preset(&mgr.data_dir, &name)?;
+                println!("Deleted preset {}", p.name.bold());
             }
         },
 

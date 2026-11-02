@@ -3,6 +3,8 @@
 //! The option list itself lives in `schema_data.rs` (taken from Mango's own
 //! source and docs); this module turns it into pages for the CLI.
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
 use super::schema_data::{OPTIONS, PAGES};
@@ -59,7 +61,17 @@ fn default_layout_option() -> OptionItem {
     }
 }
 
+/// The pages, built once: lookups run on every staged change and search key.
+pub fn schema_pages() -> &'static [Page] {
+    static PAGES_CACHE: OnceLock<Vec<Page>> = OnceLock::new();
+    PAGES_CACHE.get_or_init(build_pages)
+}
+
 pub fn get_schema_pages() -> Vec<Page> {
+    schema_pages().to_vec()
+}
+
+fn build_pages() -> Vec<Page> {
     PAGES
         .iter()
         .map(|(id, title, description)| {
@@ -90,18 +102,20 @@ pub fn get_schema_pages() -> Vec<Page> {
 
 /// Look up one option by its Mango key.
 pub fn find_option(key: &str) -> Option<OptionItem> {
-    get_schema_pages()
-        .into_iter()
-        .flat_map(|p| p.options)
+    schema_pages()
+        .iter()
+        .flat_map(|p| &p.options)
         .find(|o| o.key == key)
+        .cloned()
 }
 
 /// Find options whose key or label contains `query` (case-insensitive).
 pub fn search_options(query: &str) -> Vec<OptionItem> {
     let q = query.to_lowercase();
-    get_schema_pages()
-        .into_iter()
-        .flat_map(|p| p.options)
+    schema_pages()
+        .iter()
+        .flat_map(|p| &p.options)
         .filter(|o| o.key.contains(&q) || o.label.to_lowercase().contains(&q))
+        .cloned()
         .collect()
 }

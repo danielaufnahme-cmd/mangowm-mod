@@ -8,7 +8,10 @@ use adw::prelude::*;
 use gtk::glib::{self, clone};
 
 use mangowm_mod::bar::generate::{module_option_value, waybar_module_name};
-use mangowm_mod::bar::model::{module_base, Backend, BarConfig, KNOWN_MODULES, SECTIONS};
+use mangowm_mod::bar::buttons::MODULE_PREFIX;
+use mangowm_mod::bar::model::{
+    memory_displays, module_base, Backend, BarConfig, KNOWN_MODULES, SECTIONS,
+};
 use mangowm_mod::bar::options::{format_opt_value, module_opts, OptKind};
 
 use super::BarPage;
@@ -18,6 +21,9 @@ use super::BarPage;
 const EXTRA_CHOICES: &[&str] = &["clock#date", "clock#time", "battery#", "custom/"];
 
 pub fn describe(name: &str) -> String {
+    if name.starts_with(MODULE_PREFIX) {
+        return "Custom button (set it up under Custom Buttons)".to_string();
+    }
     if let Some(c) = name.strip_prefix("custom/") {
         return format!("Custom module “{}”: runs a command", c);
     }
@@ -133,9 +139,11 @@ impl BarPage {
         }
 
         let sig = format!(
-            "{:?} {} {}",
+            "{:?} {} {} {}",
             bar.backend,
             bar.waybar_mango_modules,
+            // the memory format shown follows the display choice
+            bar.memory_display,
             all.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
         );
         if *self.modules.built_for.borrow() != sig {
@@ -153,7 +161,11 @@ impl BarPage {
         position: usize,
         total: usize,
     ) -> adw::ActionRow {
-        let mut subtitle = describe(name);
+        let mut subtitle = match bar.button_for_module(name) {
+            Some(b) if b.label.is_empty() => format!("Custom button {}", b.text()),
+            Some(b) => format!("Custom button {} {}", b.text(), b.label),
+            None => describe(name),
+        };
         if bar.backend == Backend::Waybar
             && waybar_module_name(name, bar.waybar_mango_modules).is_none()
         {
@@ -193,10 +205,18 @@ impl BarPage {
     /// name field for battery#<device> and custom/<name>.
     fn add_row(self: &Rc<Self>, bar: &BarConfig, section: &'static str) -> adw::ActionRow {
         let used: Vec<&String> = bar.modules.all().collect();
+        // buttons taken out of the bar can come back here
+        let hidden: Vec<String> = bar
+            .buttons
+            .iter()
+            .map(|b| b.module())
+            .filter(|m| !used.contains(&m))
+            .collect();
         let choices: Vec<&str> = KNOWN_MODULES
             .iter()
             .map(|(m, _)| *m)
             .chain(EXTRA_CHOICES.iter().copied())
+            .chain(hidden.iter().map(String::as_str))
             .filter(|m| !used.iter().any(|u| u == m))
             .collect();
         let row = adw::ActionRow::builder()
@@ -262,6 +282,37 @@ impl BarPage {
         row
     }
 
+    /// "Show": the memory display choices the program can show.
+    fn memory_display_row(self: &Rc<Self>, bar: &BarConfig) -> adw::ComboRow {
+        let choices = memory_displays(bar.backend);
+        let labels: Vec<&str> = choices.iter().map(|(_, l)| *l).collect();
+        let row = adw::ComboRow::builder()
+            .title("Show")
+            .model(&gtk::StringList::new(&labels))
+            .build();
+        if bar.backend == Backend::Mangobar {
+            row.set_subtitle("Mangobar's memory module has only the percentage");
+        } else {
+            row.set_subtitle("A Format below overrides this");
+        }
+        row.set_selected(
+            choices
+                .iter()
+                .position(|(d, _)| *d == bar.memory_display)
+                .unwrap_or(0) as u32,
+        );
+        row.connect_selected_notify(clone!(
+            #[weak(rename_to = st)]
+            self,
+            move |r| {
+                if let Some((d, _)) = choices.get(r.selected() as usize) {
+                    st.set("memory-display", d);
+                }
+            }
+        ));
+        row
+    }
+
     /// One expander per module with the options the selected program has.
     fn build_settings(self: &Rc<Self>, bar: &BarConfig) {
         let expanded: Vec<String> = self
@@ -282,57 +333,84 @@ impl BarPage {
             {
                 continue;
             }
+            // set up in the Custom Buttons group
+            if bar.button_for_module(module).is_some() {
+                continue;
+            }
             let exp = adw::ExpanderRow::builder()
                 .title(module.as_str())
                 .subtitle(describe(module))
                 .use_markup(false)
                 .expanded(expanded.contains(module))
                 .build();
-            for opt in module_opts(module) {
-                if !opt.supported(bar.backend) {
-                    continue;
-                }
-                let key = format!("{}.{}", module, opt.key);
-                let current = module_option_value(bar, module, opt.key);
-                let tip = format!("{} → {}", key, opt.key_for(bar.backend).unwrap_or(opt.key));
-                if opt.kind == OptKind::Bool {
-                    let sw = adw::SwitchRow::builder()
-                        .title(opt.label)
-                        .tooltip_text(&tip)
-                        .active(current.and_then(|v| v.as_bool()).unwrap_or(false))
-                        .build();
-                    sw.connect_active_notify(clone!(
-                        #[weak(rename_to = st)]
-                        self,
-                        move |r| st.set(&key, &r.is_active().to_string())
-                    ));
-                    exp.add_row(&sw);
-                } else {
-                    let entry = adw::EntryRow::builder()
-                        .title(opt.label)
-                        .tooltip_text(&tip)
-                        .show_apply_button(true)
-                        .build();
-                    entry.set_text(&current.map(|v| format_opt_value(&v)).unwrap_or_default());
-                    entry.connect_apply(clone!(
-                        #[weak(rename_to = st)]
-                        self,
-                        move |r| {
-                            let text = r.text().to_string();
-                            if text.trim().is_empty() {
-                                st.unset(&key);
-                            } else {
-                                st.set(&key, &text);
-                            }
+            // the option rows are built when the row is first opened
+            if exp.is_expanded() {
+                self.fill_settings(&exp, bar, module);
+            } else {
+                let module = module.clone();
+                let filled = std::cell::Cell::new(false);
+                exp.connect_expanded_notify(clone!(
+                    #[weak(rename_to = st)]
+                    self,
+                    move |exp| {
+                        if exp.is_expanded() && !filled.replace(true) {
+                            st.fill_settings(exp, &st.bar(), &module);
                         }
-                    ));
-                    exp.add_row(&entry);
-                }
+                    }
+                ));
             }
             self.modules.settings.add(&exp);
             rows.push(exp);
         }
         self.modules.settings.set_visible(!rows.is_empty());
         *self.modules.setting_rows.borrow_mut() = rows;
+    }
+
+    /// The option rows of one module's expander.
+    fn fill_settings(self: &Rc<Self>, exp: &adw::ExpanderRow, bar: &BarConfig, module: &str) {
+        if module == "memory" {
+            exp.add_row(&self.memory_display_row(bar));
+        }
+        for opt in module_opts(module) {
+            if !opt.supported(bar.backend) {
+                continue;
+            }
+            let key = format!("{}.{}", module, opt.key);
+            let current = module_option_value(bar, module, opt.key);
+            let tip = format!("{} → {}", key, opt.key_for(bar.backend).unwrap_or(opt.key));
+            if opt.kind == OptKind::Bool {
+                let sw = adw::SwitchRow::builder()
+                    .title(opt.label)
+                    .tooltip_text(&tip)
+                    .active(current.and_then(|v| v.as_bool()).unwrap_or(false))
+                    .build();
+                sw.connect_active_notify(clone!(
+                    #[weak(rename_to = st)]
+                    self,
+                    move |r| st.set(&key, &r.is_active().to_string())
+                ));
+                exp.add_row(&sw);
+            } else {
+                let entry = adw::EntryRow::builder()
+                    .title(opt.label)
+                    .tooltip_text(&tip)
+                    .show_apply_button(true)
+                    .build();
+                entry.set_text(&current.map(|v| format_opt_value(&v)).unwrap_or_default());
+                entry.connect_apply(clone!(
+                    #[weak(rename_to = st)]
+                    self,
+                    move |r| {
+                        let text = r.text().to_string();
+                        if text.trim().is_empty() {
+                            st.unset(&key);
+                        } else {
+                            st.set(&key, &text);
+                        }
+                    }
+                ));
+                exp.add_row(&entry);
+            }
+        }
     }
 }

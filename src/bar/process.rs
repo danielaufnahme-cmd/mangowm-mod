@@ -481,6 +481,11 @@ pub fn start_bar(bar: &BarConfig, dir: Option<&Path>, data_dir: &Path) -> Result
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
+    // reap the bar when it exits, so a long-running GUI collects no zombies
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+
     let pid_path = pid_file(data_dir);
     atomic_write(&pid_path, &format!("{} {}\n", pid, binary)).with_context(|| {
         format!(
@@ -489,4 +494,76 @@ pub fn start_bar(bar: &BarConfig, dir: Option<&Path>, data_dir: &Path) -> Result
         )
     })?;
     Ok(pid)
+}
+
+/// Our running bar: (PID, program), from the PID file or `-c <our config>`.
+fn our_running_bar(data_dir: &Path) -> Option<(u32, String)> {
+    if !have_proc() {
+        return None;
+    }
+    if let Some((pid, binary)) = read_pid_file(&pid_file(data_dir)) {
+        if is_our_process(pid, &binary) {
+            return Some((pid, binary));
+        }
+    }
+    let targets = our_configs(&BarConfig::default(), None);
+    find_ours(&targets)
+        .ok()?
+        .into_iter()
+        .next()
+        .map(|(pid, b)| (pid, b.to_string()))
+}
+
+/// What [`update_live`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveUpdate {
+    /// Files written; no bar of ours is running (or restarting was not allowed).
+    Written,
+    /// The files did not change (e.g. only a button's action did): nothing to do.
+    Unchanged,
+    /// Waybar reloaded its files (SIGUSR2).
+    Reloaded(u32),
+    /// The bar was restarted (Mangobar has no reload); the new PID.
+    Restarted(u32),
+}
+
+/// Write the bar files and show them in our running bar. Waybar reloads on
+/// SIGUSR2; Mangobar reads its files only at start (no reload signal or
+/// file watch in mangobar.c), so it is restarted. A different program than
+/// the running one is started in its place. `restart` false only writes.
+pub fn update_live(bar: &BarConfig, data_dir: &Path, restart: bool) -> Result<LiveUpdate> {
+    let dir = bar_dir(bar.backend);
+    let old = (
+        fs::read_to_string(dir.join(CONFIG_FILE)).ok(),
+        fs::read_to_string(dir.join(STYLE_FILE)).ok(),
+    );
+    let dir = super::generate::write_bar_files(bar, Some(&dir))?;
+    let new = (
+        Some(super::generate::generate_config(bar)),
+        Some(super::generate::generate_style(bar)),
+    );
+    if !restart {
+        return Ok(if old == new {
+            LiveUpdate::Unchanged
+        } else {
+            LiveUpdate::Written
+        });
+    }
+    let Some((pid, binary)) = our_running_bar(data_dir) else {
+        return Ok(LiveUpdate::Written);
+    };
+    let same_program = binary == bar.backend.binary();
+    if old == new && same_program {
+        return Ok(LiveUpdate::Unchanged);
+    }
+    #[cfg(unix)]
+    if same_program && bar.backend == Backend::Waybar {
+        let pid_t = libc::pid_t::try_from(pid).map_err(|_| anyhow!("invalid PID {}", pid))?;
+        // SAFETY: kill(2) only takes plain integers.
+        if unsafe { libc::kill(pid_t, libc::SIGUSR2) } == 0 {
+            return Ok(LiveUpdate::Reloaded(pid));
+        }
+    }
+    let _ = pid;
+    start_bar(bar, Some(&dir), data_dir).map(LiveUpdate::Restarted)
 }

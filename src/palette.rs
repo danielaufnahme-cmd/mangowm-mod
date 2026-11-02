@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bar::generate::write_bar_files;
 use crate::bar::model::BarConfig;
-use crate::bar::process::{pid_file, start_bar};
+use crate::bar::process::{our_bar_running, start_bar, update_live, LiveUpdate};
 use crate::core::fsutil::{atomic_write, read_text};
 use crate::core::manager::ConfigManager;
 
@@ -556,31 +556,30 @@ pub fn bar_colors(p: &Palette, bar: &mut BarConfig) {
     bar.border_color = p.border().hex_alpha(border_alpha);
 }
 
-/// Put `p` into the saved bar settings (`<data_dir>/bar.json`) and write the
-/// bar files into `dir` (default: the bar's config folder). Does not restart it.
-pub fn apply_bar_colors(p: &Palette, data_dir: &Path, dir: Option<&Path>) -> Result<BarConfig> {
+/// Put `p` into the saved bar settings (`<data_dir>/bar.json`) only; no bar
+/// files are written.
+pub fn save_bar_colors(p: &Palette, data_dir: &Path) -> Result<BarConfig> {
     let path = BarConfig::default_path(data_dir);
     let mut bar = BarConfig::load(&path)?;
     bar_colors(p, &mut bar);
     bar.save(&path)?;
+    Ok(bar)
+}
+
+/// Put `p` into the saved bar settings (`<data_dir>/bar.json`) and write the
+/// bar files into `dir` (default: the bar's config folder). Does not restart it.
+pub fn apply_bar_colors(p: &Palette, data_dir: &Path, dir: Option<&Path>) -> Result<BarConfig> {
+    let bar = save_bar_colors(p, data_dir)?;
     write_bar_files(&bar, dir)?;
     Ok(bar)
 }
 
-/// True when the bar MangoWM Mod started (its PID file) is still running.
-pub fn bar_running(data_dir: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(pid_file(data_dir)) else {
-        return false;
-    };
-    let mut parts = text.split_whitespace();
-    let (Some(pid), Some(binary)) = (parts.next(), parts.next()) else {
-        return false;
-    };
-    if pid.parse::<u32>().map_or(true, |p| p <= 1) {
-        return false;
-    }
-    std::fs::read_to_string(format!("/proc/{}/comm", pid))
-        .is_ok_and(|comm| comm.trim() == binary)
+/// Save the colours, write the bar files and show them in the running bar,
+/// like an edit on the Bar page ([`update_live`]). Writes the real bar
+/// folder; may block while Mangobar restarts, so call it off the UI thread.
+pub fn apply_bar_colors_live(p: &Palette, data_dir: &Path) -> Result<LiveUpdate> {
+    let bar = save_bar_colors(p, data_dir)?;
+    update_live(&bar, data_dir, true)
 }
 
 /// Restart the bar with new files, but only when ours is running already.
@@ -590,7 +589,7 @@ pub fn restart_bar_if_running(
     dir: Option<&Path>,
     data_dir: &Path,
 ) -> Result<Option<u32>> {
-    if !bar_running(data_dir) {
+    if !our_bar_running(data_dir) {
         return Ok(None);
     }
     start_bar(bar, dir, data_dir).map(Some)

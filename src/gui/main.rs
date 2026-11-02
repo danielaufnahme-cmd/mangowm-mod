@@ -53,6 +53,7 @@ pub struct GuiArgs {
 }
 
 fn main() -> glib::ExitCode {
+    let started = std::time::Instant::now();
     let args = GuiArgs::parse();
     if args.dev.screenshot.is_some() && std::env::var("GDK_BACKEND").as_deref() != Ok("broadway") {
         eprintln!("--screenshot only runs offscreen: set GDK_BACKEND=broadway");
@@ -107,6 +108,10 @@ fn main() -> glib::ExitCode {
             });
         }
         win.window.present();
+        if ctx::profiling() {
+            ctx::since(started, "start -> window presented");
+            glib::idle_add_local_once(move || ctx::since(started, "start -> main loop idle"));
+        }
         if args.dev.screenshot.is_some() {
             screenshot::run(app, win, &args.dev);
         }

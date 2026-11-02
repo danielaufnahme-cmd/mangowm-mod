@@ -13,9 +13,9 @@ use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::gdk_pixbuf::Pixbuf;
 use gtk::{gio, glib};
 
-use mangowm_mod::bar::generate::bar_dir;
+use mangowm_mod::bar::process::LiveUpdate;
 use mangowm_mod::palette::{
-    apply_bar_colors, palette_from_file, restart_bar_if_running, stage_window_colors,
+    apply_bar_colors_live, palette_from_file, stage_window_colors,
     MatchSettings, Palette,
 };
 use mangowm_mod::wallpaper::{
@@ -24,7 +24,7 @@ use mangowm_mod::wallpaper::{
 };
 
 use crate::ctx::Ctx;
-use crate::presets::{rounded_rect, thumb};
+use crate::presets::{rounded_rect, thumb, Pixels};
 use crate::window::report_apply;
 
 /// Thumbnails are scaled to this width (enough for a HiDPI card).
@@ -101,19 +101,25 @@ fn preview(e: &WallpaperEntry) -> gtk::DrawingArea {
         }
     };
     let embedded = e.bundled.then(|| thumb(&e.name)).flatten();
-    if let Some(bytes) = embedded {
-        let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_static(bytes));
-        show(Pixbuf::from_stream(&stream, gio::Cancellable::NONE).ok());
-    } else {
-        let path = e.path.clone();
-        glib::spawn_future_local(async move {
-            let cached = gio::spawn_blocking(move || make_thumb(&path))
-                .await
-                .ok()
-                .flatten();
-            show(cached.and_then(|c| Pixbuf::from_file(c).ok()));
-        });
-    }
+    let path = e.path.clone();
+    // decode off the main thread: big pictures take long, even the cached ones add up
+    glib::spawn_future_local(async move {
+        let pixels = gio::spawn_blocking(move || {
+            let pb = match embedded {
+                Some(bytes) => {
+                    let stream =
+                        gio::MemoryInputStream::from_bytes(&glib::Bytes::from_static(bytes));
+                    Pixbuf::from_stream(&stream, gio::Cancellable::NONE).ok()
+                }
+                None => make_thumb(&path).and_then(|c| Pixbuf::from_file(c).ok()),
+            };
+            pb.map(|pb| Pixels::of(&pb))
+        })
+        .await
+        .ok()
+        .flatten();
+        show(pixels.map(Pixels::pixbuf));
+    });
     area
 }
 
@@ -175,17 +181,32 @@ fn set_now(ctx: &Ctx, parent: &gtk::Widget, path: &Path, colors: Option<&(Palett
     ctx.changed();
 }
 
-/// Save the bar colours, write its files and restart it if it runs.
+/// Save the bar colours and show them in the running bar (reload Waybar,
+/// restart Mangobar). The restart waits for the new bar, so it runs off the
+/// UI thread; the toast comes when it is done.
 fn bar_colors(ctx: &Ctx, palette: &Palette) {
-    let res = apply_bar_colors(palette, &ctx.data_dir, None).and_then(|bar| {
-        let dir = bar_dir(bar.backend);
-        restart_bar_if_running(&bar, Some(&dir), &ctx.data_dir)
+    let (ctx, palette) = (ctx.clone(), palette.clone());
+    glib::spawn_future_local(async move {
+        let data_dir = ctx.data_dir.clone();
+        // the offscreen screenshot mode never touches the real bar
+        let live = std::env::var("GDK_BACKEND").as_deref() != Ok("broadway");
+        let res = gio::spawn_blocking(move || {
+            if live {
+                apply_bar_colors_live(&palette, &data_dir)
+            } else {
+                mangowm_mod::palette::save_bar_colors(&palette, &data_dir)
+                    .map(|_| LiveUpdate::Written)
+            }
+        })
+        .await;
+        match res {
+            Ok(Ok(LiveUpdate::Restarted(_))) => ctx.toast("Bar colours set · bar restarted"),
+            Ok(Ok(LiveUpdate::Reloaded(_))) => ctx.toast("Bar colours set · bar reloaded"),
+            Ok(Ok(_)) => ctx.toast("Bar colours set"),
+            Ok(Err(e)) => ctx.toast(&format!("Bar colours: {:#}", e)),
+            Err(_) => ctx.toast("Bar colours: the update failed"),
+        }
     });
-    match res {
-        Ok(Some(_)) => ctx.toast("Bar colours set · bar restarted"),
-        Ok(None) => ctx.toast("Bar colours set"),
-        Err(e) => ctx.toast(&format!("Bar colours: {:#}", e)),
-    }
 }
 
 /// Apply at once; ask first only when other staged changes would go with it.
@@ -572,3 +593,4 @@ pub fn page(ctx: &Ctx) -> gtk::Widget {
         .build()
         .upcast()
 }
+

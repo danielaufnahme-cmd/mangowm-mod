@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use super::buttons::{button_id, next_id, BarButton};
 use super::options::{find_opt, parse_opt_value};
 use crate::core::fsutil::{atomic_write, read_text};
 use crate::core::values::parse_color;
@@ -50,7 +51,28 @@ pub const BAR_FIELDS: &[&str] = &[
     "right",
     "waybar-mango-modules",
     "start-at-login",
+    "memory-display",
 ];
+
+/// Font sizes the bar accepts.
+pub const FONT_SIZE_RANGE: (u32, u32) = (6, 72);
+
+/// What the memory module shows: (id, label). Mangobar only knows the
+/// percentage (mangobar `M_MEM` formats one value), see [`memory_displays`].
+pub const MEMORY_DISPLAYS: &[(&str, &str)] = &[
+    ("percent", "Percent"),
+    ("used", "Used GB"),
+    ("used-total", "Used / total GB"),
+    ("both", "Both"),
+];
+
+/// The memory displays `backend` can show.
+pub fn memory_displays(backend: Backend) -> &'static [(&'static str, &'static str)] {
+    match backend {
+        Backend::Mangobar => &MEMORY_DISPLAYS[..1],
+        Backend::Waybar => MEMORY_DISPLAYS,
+    }
+}
 
 /// Space between the text line and a module's top/bottom edge.
 pub const TEXT_INSET: u32 = 4;
@@ -381,6 +403,17 @@ pub struct BarConfig {
     /// left out.
     #[serde(default)]
     pub waybar_mango_modules: bool,
+    /// Memory module text, one of [`MEMORY_DISPLAYS`] (a `memory.format`
+    /// override wins).
+    #[serde(default = "default_memory_display")]
+    pub memory_display: String,
+    /// The preset last applied: a built-in id or `user:<slug>`. The Bar page
+    /// shows "Modified" once the settings differ from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Custom buttons; each is the module `custom/btn-<id>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buttons: Vec<BarButton>,
     /// Extra top-level config keys (e.g. "sys-interval", Waybar "position").
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, Value>,
@@ -469,6 +502,9 @@ fn default_layer() -> String {
 fn default_true() -> bool {
     true
 }
+fn default_memory_display() -> String {
+    "percent".to_string()
+}
 
 impl Default for BarConfig {
     fn default() -> Self {
@@ -506,6 +542,9 @@ impl Default for BarConfig {
             tag_fill: true,
             start_at_login: true,
             waybar_mango_modules: false,
+            memory_display: default_memory_display(),
+            preset: None,
+            buttons: Vec::new(),
             options: BTreeMap::new(),
             module_options: BTreeMap::new(),
         }
@@ -603,8 +642,25 @@ impl BarConfig {
         if self.height == 0 || self.height > 500 {
             bail!("bar height must be 1-500");
         }
-        if self.font_size == 0 || self.font_size > 200 {
-            bail!("font size must be 1-200");
+        let (lo, hi) = FONT_SIZE_RANGE;
+        if self.font_size < lo || self.font_size > hi {
+            bail!("font size must be {}-{}", lo, hi);
+        }
+        if !MEMORY_DISPLAYS.iter().any(|(d, _)| *d == self.memory_display) {
+            bail!(
+                "memory display must be one of {}",
+                MEMORY_DISPLAYS
+                    .iter()
+                    .map(|(d, _)| *d)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        for (i, b) in self.buttons.iter().enumerate() {
+            b.validate()?;
+            if self.buttons[..i].iter().any(|o| o.id == b.id) {
+                bail!("two buttons have the id {:?}", b.id);
+            }
         }
         if self.title_length > 500 {
             bail!("title length must be 0-500 characters");
@@ -738,6 +794,7 @@ impl BarConfig {
             "left" => self.modules.left = parse_module_list(value)?,
             "center" => self.modules.center = parse_module_list(value)?,
             "right" => self.modules.right = parse_module_list(value)?,
+            "memory-display" => self.memory_display = value.trim().to_string(),
             "waybar-mango-modules" => {
                 self.waybar_mango_modules = crate::core::values::parse_bool(value)
                     .context("waybar-mango-modules must be true or false")?
@@ -799,5 +856,82 @@ impl BarConfig {
         } else {
             self.options.remove(key).is_some()
         }
+    }
+}
+
+impl BarConfig {
+    pub fn button(&self, id: &str) -> Option<&BarButton> {
+        self.buttons.iter().find(|b| b.id == id)
+    }
+
+    pub fn button_mut(&mut self, id: &str) -> Option<&mut BarButton> {
+        self.buttons.iter_mut().find(|b| b.id == id)
+    }
+
+    /// The button of a `custom/btn-<id>` module.
+    pub fn button_for_module(&self, module: &str) -> Option<&BarButton> {
+        button_id(module).and_then(|id| self.button(id))
+    }
+
+    /// Add a button (a new id is given when its id is empty or taken) at
+    /// the end of `section`. Returns the id.
+    pub fn add_button(&mut self, mut button: BarButton, section: &str) -> Result<String> {
+        if button.id.is_empty() || self.button(&button.id).is_some() {
+            button.id = next_id(&self.buttons);
+        }
+        button.validate()?;
+        let module = button.module();
+        if self.modules.all().any(|m| *m == module) {
+            bail!("{} is already in the bar", module);
+        }
+        self.modules.section_mut(section)?.push(module);
+        let id = button.id.clone();
+        self.buttons.push(button);
+        Ok(id)
+    }
+
+    /// Remove a button and its module. False when there is no such button.
+    pub fn remove_button(&mut self, id: &str) -> bool {
+        let Some(pos) = self.buttons.iter().position(|b| b.id == id) else {
+            return false;
+        };
+        let module = self.buttons.remove(pos).module();
+        for list in [
+            &mut self.modules.left,
+            &mut self.modules.center,
+            &mut self.modules.right,
+        ] {
+            list.retain(|m| *m != module);
+        }
+        self.module_options.remove(&module);
+        true
+    }
+
+    /// Section the button's module is in; `None` when it is not in the bar.
+    pub fn button_section(&self, id: &str) -> Option<&'static str> {
+        let module = self.button(id)?.module();
+        SECTIONS
+            .iter()
+            .copied()
+            .find(|s| self.modules.section(s).is_ok_and(|l| l.contains(&module)))
+    }
+
+    /// Move the button to the end of `section`, or out of the bar (`None`).
+    pub fn set_button_section(&mut self, id: &str, section: Option<&str>) -> Result<()> {
+        let module = self.button(id).context("no such button")?.module();
+        if section.is_some() && self.button_section(id) == section {
+            return Ok(());
+        }
+        for list in [
+            &mut self.modules.left,
+            &mut self.modules.center,
+            &mut self.modules.right,
+        ] {
+            list.retain(|m| *m != module);
+        }
+        if let Some(s) = section {
+            self.modules.section_mut(s)?.push(module);
+        }
+        Ok(())
     }
 }

@@ -17,4 +17,4 @@ pub use items::{Bind, Monitor, Rule};
 pub use managed::{parse_managed, render, ManagedState};
 pub use manager::{detect_config, detect_data_dir, ApplyResult, ConfigManager};
 pub use parser::{parse_config, parse_text, ParsedConfig};
-pub use schema::{find_option, get_schema_pages, search_options, OptionItem, Page};
+pub use schema::{find_option, get_schema_pages, schema_pages, search_options, OptionItem, Page};

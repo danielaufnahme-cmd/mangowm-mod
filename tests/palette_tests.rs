@@ -3,7 +3,7 @@ use mangowm_mod::bar::model::BarConfig;
 use mangowm_mod::core::manager::ConfigManager;
 use mangowm_mod::palette::{
     apply_bar_colors, bar_colors, contrast, palette_from_file, palette_from_image,
-    stage_window_colors, window_colors, MatchSettings, Palette, Rgb, MIN_ACCENT_CONTRAST,
+    save_bar_colors, stage_window_colors, window_colors, MatchSettings, Palette, Rgb, MIN_ACCENT_CONTRAST,
     MIN_MUTED_CONTRAST, MIN_TEXT_CONTRAST,
 };
 use std::fs;
@@ -290,6 +290,19 @@ fn test_bar_colors_without_saved_bar() {
     let saved = apply_bar_colors(&p, tmp.path(), Some(&tmp.path().join("out"))).unwrap();
     assert_eq!(saved.accent_color, p.accent.hex_alpha(0xff));
     assert!(BarConfig::default_path(tmp.path()).is_file());
+}
+
+/// Only the settings are saved; the live path (`apply_bar_colors_live`) is
+/// not tested because it writes the real bar folder and may restart the real bar.
+#[test]
+fn test_save_bar_colors_writes_only_bar_json() {
+    let tmp = tempdir().unwrap();
+    let p = palette_from_image(&teal_with_orange());
+    let saved = save_bar_colors(&p, tmp.path()).unwrap();
+    assert_eq!(saved.accent_color, p.accent.hex_alpha(0xff));
+    let again = BarConfig::load(&BarConfig::default_path(tmp.path())).unwrap();
+    assert_eq!(again.accent_color, saved.accent_color);
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
 }
 
 #[test]

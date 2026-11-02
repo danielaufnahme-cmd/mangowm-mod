@@ -12,6 +12,7 @@ use adw::prelude::*;
 use clap::Args;
 use gtk::{gdk, glib, graphene, gsk};
 
+use crate::ctx::timed;
 use crate::window::MainWindow;
 
 #[derive(Args, Debug, Default)]
@@ -85,8 +86,8 @@ pub fn run(app: &adw::Application, win: MainWindow, dev: &DevArgs) {
             }
             for s in &sets {
                 let (k, v) = s.split_once('=').unwrap_or((s, ""));
-                match st.rows.iter().find(|r| r.key == k) {
-                    Some(r) => r.simulate(v),
+                match st.row(k) {
+                    Some(r) => timed(&format!("change {}={}", k, v), || r.simulate(v)),
                     None => eprintln!("screenshot: no row for {}", k),
                 }
             }
