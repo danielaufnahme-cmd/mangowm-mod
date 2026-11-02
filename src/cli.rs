@@ -7,12 +7,16 @@ use std::path::{Path, PathBuf};
 
 use crate::bar::generate::{bar_dir, warnings, waybar_module_name, write_bar_files};
 use crate::bar::model::{Backend, BarConfig, KNOWN_MODULES};
-use crate::bar::process::{log_file, start_bar, stop_bar};
+use crate::bar::login::{
+    disable_unmanaged_bars, login_state, set_login_start, unmanaged_bar_lines, LoginState,
+};
+use crate::bar::process::{foreign_bars, log_file, start_bar, stop_bar, stop_foreign};
 use crate::core::actions::get_actions;
 use crate::core::items::{Bind, Monitor, Rule};
 use crate::core::manager::{detect_data_dir, ApplyResult, ConfigManager};
 use crate::core::schema::{get_schema_pages, search_options, OptionItem};
-use crate::presets::{find_preset, list_presets};
+use crate::presets::{apply_preset, find_preset, list_presets};
+use crate::wallpaper::set_wallpaper;
 
 /// Rule kinds `rule add` accepts (monitor rules go through `monitor`).
 pub const RULE_ADD_KINDS: &[&str] = &[
@@ -108,6 +112,12 @@ pub enum Commands {
         action: MonitorCommands,
     },
 
+    #[command(about = "Mango's wallpaper (shown with swaybg)")]
+    Wallpaper {
+        #[command(subcommand)]
+        action: WallpaperCommands,
+    },
+
     #[command(about = "Programs started by MangoWM (exec_once / exec)")]
     Autostart {
         #[command(subcommand)]
@@ -134,6 +144,12 @@ pub enum PresetCommands {
 
     #[command(about = "Apply a preset by ID or name (applies at once)")]
     Apply { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WallpaperCommands {
+    #[command(about = "Set the wallpaper to a picture file (applies at once)")]
+    Set { path: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -249,8 +265,10 @@ pub struct BarFlags {
     pub backend: Option<Backend>,
     #[arg(long)]
     pub height: Option<u32>,
-    #[arg(long)]
-    pub radius: Option<u32>,
+    #[arg(long, allow_negative_numbers = true, help = "Corner radius; -1 = pill")]
+    pub radius: Option<i32>,
+    #[arg(long, help = "Waybar: top or bottom")]
+    pub position: Option<String>,
     #[arg(long, help = "Background color, e.g. #1e1e2eeb")]
     pub bg: Option<String>,
     #[arg(long, help = "Text color")]
@@ -297,6 +315,7 @@ impl BarFlags {
         add("font", self.font.clone());
         add("font-size", self.font_size.map(|v| v.to_string()));
         add("layer", self.layer.clone());
+        add("position", self.position.clone());
         add("left", self.left.clone());
         add("center", self.center.clone());
         add("right", self.right.clone());
@@ -320,8 +339,29 @@ pub enum BarCommands {
 
     #[command(about = "Generate the bar files and start the bar")]
     Start {
+        #[arg(
+            long,
+            help = "First stop a Waybar/Mangobar that mangowm-mod did not start"
+        )]
+        replace: bool,
         #[command(flatten)]
         flags: BarFlags,
+    },
+
+    #[command(
+        about = "Start the bar at login (staged exec_once in mango-mod.conf; run `apply`)"
+    )]
+    Login {
+        #[arg(value_name = "on|off", help = "Leave out to show the state")]
+        state: Option<String>,
+    },
+
+    #[command(
+        about = "Comment out exec_once=waybar/mangobar in config.conf (backup first), so only this bar starts"
+    )]
+    Migrate {
+        #[arg(long, help = "Only show the lines")]
+        check: bool,
     },
 
     #[command(about = "Stop the bar started by mangowm-mod")]
@@ -438,10 +478,25 @@ fn run_bar(action: BarCommands, data_dir: &Path) -> Result<()> {
             print_bar_warnings(&bar);
         }
 
-        BarCommands::Start { flags } => {
+        BarCommands::Start { replace, flags } => {
             let bar = bar_with_flags(data_dir, &flags)?;
             let dir = write_bar_files(&bar, None::<&Path>)?;
             print_bar_warnings(&bar);
+            let others = foreign_bars(&bar, data_dir);
+            if replace {
+                for msg in stop_foreign(&others)? {
+                    println!("{}", msg);
+                }
+            } else {
+                for b in &others {
+                    println!(
+                        "{}: another bar is running (PID {}: {}); use --replace to stop it",
+                        "warning".yellow(),
+                        b.pid,
+                        b.command
+                    );
+                }
+            }
             let pid = start_bar(&bar, Some(&dir), data_dir)?;
             println!(
                 "{} started (PID {}) with {}; log: {}",
@@ -491,6 +546,10 @@ fn run_bar(action: BarCommands, data_dir: &Path) -> Result<()> {
             }
         }
 
+        BarCommands::Login { .. } | BarCommands::Migrate { .. } => {
+            unreachable!("needs the Mango config; handled in run_bar_login")
+        }
+
         BarCommands::Modules => {
             println!("{}", "Bar modules (Waybar name in brackets):".bold().cyan());
             for (name, desc) in KNOWN_MODULES {
@@ -498,8 +557,65 @@ fn run_bar(action: BarCommands, data_dir: &Path) -> Result<()> {
                 println!("  {:<16} {:<44} [{}]", name.cyan(), desc, wb);
             }
             println!("  Also: clock#date, clock#time, battery#<device>, custom/<name>");
-            println!("  Waybar without mango/* modules: workspaces -> ext/workspaces; layout, window, keymode and keyboardlayout are left out");
+            println!("  Waybar without mango/* modules: workspaces -> ext/workspaces, window -> custom/mango-window; layout, keymode and keyboardlayout are left out");
         }
+    }
+    Ok(())
+}
+
+/// `bar login` / `bar migrate`: these change Mango's config files.
+fn run_bar_login(action: BarCommands, mgr: &mut ConfigManager) -> Result<()> {
+    match action {
+        BarCommands::Login { state } => {
+            let Some(state) = state else {
+                let text = match login_state(mgr) {
+                    LoginState::Applied => "on (in mango-mod.conf)",
+                    LoginState::Staged => "on (staged, run `mangowm-mod apply`)",
+                    LoginState::Removing => "off (staged, run `mangowm-mod apply`)",
+                    LoginState::Off => "off",
+                };
+                println!("Start bar at login: {}", text);
+                return Ok(());
+            };
+            let enabled = crate::core::values::parse_bool(&state)
+                .ok_or_else(|| anyhow!("use on or off"))?;
+            let (mut bar, path) = load_bar(&mgr.data_dir)?;
+            if bar.start_at_login != enabled {
+                bar.start_at_login = enabled;
+                bar.save(&path)?;
+            }
+            if set_login_start(mgr, enabled)? {
+                println!(
+                    "Staged: start bar at login {}",
+                    if enabled { "on".green() } else { "off".red() }
+                );
+                staged_hint();
+            } else {
+                println!("Nothing to change.");
+            }
+        }
+        BarCommands::Migrate { check } => {
+            let text = std::fs::read_to_string(&mgr.config_path).unwrap_or_default();
+            let lines = unmanaged_bar_lines(&text);
+            if lines.is_empty() {
+                println!("{} starts no other bar.", mgr.config_path.display());
+                return Ok(());
+            }
+            for (n, l) in &lines {
+                println!("  {}:{}  {}", mgr.config_path.display(), n, l.trim());
+            }
+            if check {
+                return Ok(());
+            }
+            if let Some((id, n)) = disable_unmanaged_bars(&mgr.config_path, &mgr.backups)? {
+                println!("Backup created: {}", id);
+                println!(
+                    "Commented out {} line(s); takes effect at the next login.",
+                    n
+                );
+            }
+        }
+        _ => unreachable!("only login and migrate"),
     }
     Ok(())
 }
@@ -507,11 +623,19 @@ fn run_bar(action: BarCommands, data_dir: &Path) -> Result<()> {
 pub fn run_cli(cli: Cli) -> Result<()> {
     let command = cli.command.unwrap_or(Commands::Status);
 
-    // Bar commands work without any Mango config.
-    if let Commands::Bar { action } = command {
-        let data_dir = detect_data_dir(cli.data_dir.as_deref());
-        return run_bar(action, &data_dir);
-    }
+    // Bar commands work without any Mango config (but login/migrate edit it).
+    let command = match command {
+        Commands::Bar { action }
+            if !matches!(
+                action,
+                BarCommands::Login { .. } | BarCommands::Migrate { .. }
+            ) =>
+        {
+            let data_dir = detect_data_dir(cli.data_dir.as_deref());
+            return run_bar(action, &data_dir);
+        }
+        other => other,
+    };
 
     let mut mgr = ConfigManager::new(
         cli.config.as_deref(),
@@ -521,7 +645,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
     )?;
 
     match command {
-        Commands::Bar { .. } => unreachable!("handled above"),
+        Commands::Bar { action } => run_bar_login(action, &mut mgr)?,
 
         Commands::Status => {
             println!("{}", "=== MangoWM Mod ===".bold().cyan());
@@ -637,10 +761,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             PresetCommands::Apply { name } => {
                 let preset =
                     find_preset(&name).ok_or_else(|| anyhow!("preset {:?} not found", name))?;
-                for (k, v) in &preset.settings {
-                    mgr.set(k, v)?;
-                }
-                let res = mgr.apply()?;
+                let res = apply_preset(&mut mgr, &preset)?;
                 println!("Preset: {}", preset.name.green().bold());
                 if !print_apply(&res) {
                     std::process::exit(1);
@@ -820,6 +941,16 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 let r = mgr.remove_rule(&["monitor_rule"], number)?;
                 println!("Staged removal: {}", r.to_config_line().red());
                 staged_hint();
+            }
+        },
+
+        Commands::Wallpaper { action } => match action {
+            WallpaperCommands::Set { path } => {
+                let res = set_wallpaper(&mut mgr, &path)?;
+                println!("Wallpaper: {}", path.display().to_string().green().bold());
+                if !print_apply(&res) {
+                    std::process::exit(1);
+                }
             }
         },
 

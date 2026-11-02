@@ -6,7 +6,7 @@ use mangowm_mod::core::schema::{find_option, get_schema_pages};
 use mangowm_mod::core::schema_data::KNOWN_MANGO_KEYS;
 use mangowm_mod::core::values::format_option_value;
 use mangowm_mod::ipc::ReloadStatus;
-use mangowm_mod::presets::list_presets;
+use mangowm_mod::presets::{apply_preset, find_preset, list_presets, wallpaper_path};
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
@@ -214,6 +214,7 @@ fn test_presets_use_schema_keys() {
     assert!(ids.contains(&"clean"));
     assert!(ids.contains(&"tokyo-night"));
     assert!(ids.contains(&"zen"));
+    assert_eq!(presets.len(), 12);
     for p in &presets {
         for (k, v) in &p.settings {
             let opt =
@@ -473,4 +474,189 @@ fn test_strip_comment_mango_semantics() {
         "exec_once=\"notify-send '# x'\""
     );
     assert_eq!(strip_comment("title='a # b' # c"), "title='a # b'");
+}
+
+#[test]
+fn test_every_preset_tiles_and_sets_wallpaper() {
+    for p in list_presets() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("config.conf"), "border_px=4\n").unwrap();
+        let mut mgr = manager(tmp.path());
+        let res = apply_preset(&mut mgr, &p).unwrap();
+        assert!(res.ok, "preset {}: {:?}", p.id, res.errors);
+
+        let text = fs::read_to_string(tmp.path().join("mango-mod.conf")).unwrap();
+        assert!(
+            text.contains("tag_rule=id:*,layout_name:tile\n"),
+            "preset {} does not tile:\n{}",
+            p.id,
+            text
+        );
+        assert!(text.contains("new_is_master=0\n"), "preset {}", p.id);
+        let swaybg: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("exec_once=swaybg"))
+            .collect();
+        assert_eq!(swaybg.len(), 1, "preset {}:\n{}", p.id, text);
+        let file = format!("/{}.png'", p.id);
+        assert!(swaybg[0].ends_with(&file), "{}", swaybg[0]);
+        let path = wallpaper_path(&mgr.data_dir, &p).unwrap();
+        assert!(path.is_file(), "missing wallpaper {}", path.display());
+        assert!(
+            fs::read(&path).unwrap().starts_with(b"\x89PNG"),
+            "{} is not a PNG",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn test_preset_wallpaper_replaces_previous_one() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("config.conf"),
+        "exec_once=swaybg -m fill -i /old.png\n",
+    )
+    .unwrap();
+    // an installed copy in the data dir wins over the source checkout
+    let installed = tmp.path().join("data").join("wallpapers");
+    fs::create_dir_all(&installed).unwrap();
+    fs::write(installed.join("nord.png"), b"\x89PNG").unwrap();
+
+    let mut mgr = manager(tmp.path());
+    mgr.add_autostart("waybar", false).unwrap();
+    mgr.set("shadows", "1").unwrap();
+    apply_preset(&mut mgr, &find_preset("glass").unwrap()).unwrap();
+    let res = apply_preset(&mut mgr, &find_preset("Nord").unwrap()).unwrap();
+    assert!(res.ok);
+
+    let text = fs::read_to_string(tmp.path().join("mango-mod.conf")).unwrap();
+    assert!(text.contains("exec_once=waybar\n"), "{}", text);
+    assert!(!text.contains("glass.png"), "{}", text);
+    // Glass's opacity does not leak into Nord; the user's own setting stays
+    assert!(!text.contains("focused_opacity"), "{}", text);
+    assert!(text.contains("shadows=1\n"), "{}", text);
+    let line = format!(
+        "exec_once=swaybg -m fill -i '{}'",
+        installed.join("nord.png").display()
+    );
+    assert!(text.contains(&line), "{}", text);
+    assert_eq!(text.matches("exec_once=swaybg").count(), 1);
+    // config.conf is never edited for this, but its own swaybg is pointed out
+    // (only when swaybg is installed; the check is skipped otherwise)
+    let warned = res.warnings.iter().any(|w| w.contains("/old.png"));
+    let has_swaybg = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("swaybg").is_file()))
+        .unwrap_or(false);
+    assert_eq!(warned, has_swaybg, "{:?}", res.warnings);
+}
+
+#[test]
+fn test_swaybg_line_round_trip() {
+    use mangowm_mod::wallpaper::{swaybg_command, swaybg_image};
+    for p in ["/w/plain.png", "/w/with space.jpg", "/w/it's.png"] {
+        let cmd = swaybg_command(Path::new(p));
+        assert_eq!(swaybg_image(&cmd).as_deref(), Some(Path::new(p)), "{}", cmd);
+    }
+    assert_eq!(
+        swaybg_image("swaybg -m fill -i /home/u/a.png").as_deref(),
+        Some(Path::new("/home/u/a.png"))
+    );
+    assert_eq!(swaybg_image("waybar -i /x.png"), None);
+}
+
+#[test]
+fn test_plasma_wallpaper_parsing() {
+    use mangowm_mod::wallpaper::plasma_wallpaper;
+    let rc = "\
+[Containments][1][General]
+Image=file:///wrong.png
+
+[Containments][2][Applets][5][Configuration]
+Image=file:///also-wrong.png
+
+[Containments][2][Wallpaper][org.kde.image][General]
+PreviewImage=file:///preview.png
+Image=file:///home/u/Pictures/My%20Walls/forest.png
+";
+    assert_eq!(
+        plasma_wallpaper(rc).as_deref(),
+        Some(Path::new("/home/u/Pictures/My Walls/forest.png"))
+    );
+    assert_eq!(plasma_wallpaper("[Containments][1][General]\n"), None);
+}
+
+#[test]
+fn test_wallpaper_and_presets_share_one_line() {
+    use mangowm_mod::wallpaper::set_wallpaper;
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("config.conf"), "border_px=4\n").unwrap();
+    let pic = tmp.path().join("mine.jpg");
+    fs::write(&pic, b"jpg").unwrap();
+    let mut mgr = manager(tmp.path());
+    mgr.add_autostart("waybar", false).unwrap();
+
+    apply_preset(&mut mgr, &find_preset("nord").unwrap()).unwrap();
+    // a picked wallpaper replaces only the preset's wallpaper
+    assert!(set_wallpaper(&mut mgr, &pic).unwrap().ok);
+    let text = fs::read_to_string(tmp.path().join("mango-mod.conf")).unwrap();
+    assert!(text.contains(&format!("exec_once=swaybg -m fill -i '{}'\n", pic.display())));
+    assert_eq!(text.matches("exec_once=swaybg").count(), 1, "{}", text);
+    assert!(text.contains("focus_color=0x88c0d0ff\n"), "{}", text);
+    assert!(text.contains("tag_rule=id:*,layout_name:tile\n"), "{}", text);
+    assert!(text.contains("exec_once=waybar\n"), "{}", text);
+
+    // and a preset afterwards brings its own wallpaper back
+    apply_preset(&mut mgr, &find_preset("latte").unwrap()).unwrap();
+    let text = fs::read_to_string(tmp.path().join("mango-mod.conf")).unwrap();
+    assert_eq!(text.matches("exec_once=swaybg").count(), 1, "{}", text);
+    assert!(text.contains("latte.png'"), "{}", text);
+    assert!(!text.contains("mine.jpg"), "{}", text);
+
+    assert!(set_wallpaper(&mut mgr, &tmp.path().join("missing.png")).is_err());
+}
+
+#[test]
+fn test_collect_wallpapers_order_and_marks() {
+    use mangowm_mod::wallpaper::{collect_wallpapers, mango_wallpaper};
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let bundled = tmp.path().join("bundled");
+    let mine = home.join("Pictures/Wallpapers");
+    let other = home.join("Pictures/wallpapers");
+    for d in [&bundled, &mine, &other] {
+        fs::create_dir_all(d).unwrap();
+    }
+    for f in [
+        bundled.join("nord.png"),
+        mine.join("forest.png"),
+        other.join("b.jpg"),
+        other.join("b.png"),
+        other.join("a.JPEG"),
+        other.join("notes.txt"),
+    ] {
+        fs::write(f, b"x").unwrap();
+    }
+    let plasma = mine.join("forest.png");
+    let mango = other.join("b.png");
+    let list = collect_wallpapers(&bundled, &home, Some(&plasma), Some(&mango));
+    let names: Vec<&str> = list.iter().map(|e| e.name.as_str()).collect();
+    // Plasma's first, shown once; .jpg and .png of the same name both kept
+    assert_eq!(names, ["forest", "nord", "a", "b", "b"]);
+    assert!(list[0].in_plasma && !list[0].bundled);
+    assert!(list[1].bundled);
+    assert_eq!(list.iter().filter(|e| e.in_mango).count(), 1);
+    assert_eq!(list[4].path, mango);
+    assert!(list[4].in_mango);
+
+    // Mango's current wallpaper comes from config.conf until one is managed
+    fs::write(
+        tmp.path().join("config.conf"),
+        format!("exec_once=swaybg -m fill -i {}\n", mango.display()),
+    )
+    .unwrap();
+    let mut mgr = manager(tmp.path());
+    assert_eq!(mango_wallpaper(&mgr), Some(mango.clone()));
+    mangowm_mod::wallpaper::set_wallpaper(&mut mgr, &plasma).unwrap();
+    assert_eq!(mango_wallpaper(&mgr), Some(plasma));
 }

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MangoWM Mod
+GenericName=MangoWM Settings
+Comment=Configure MangoWM and build the Mangobar/Waybar bar
+Exec=mangowm-mod-gui
+Icon=io.github.danielaufnahme_cmd.MangowmMod
+Terminal=false
+Categories=Settings;DesktopSettings;GTK;
+Keywords=mangowm;mango;wayland;compositor;settings;bar;waybar;
+StartupWMClass=io.github.danielaufnahme_cmd.MangowmMod

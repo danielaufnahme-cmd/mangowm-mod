@@ -33,7 +33,12 @@ jobs:
   distros:
     runs-on: ubuntu-latest
     name: ${{ matrix.image }}
-    container: ${{ matrix.image }}
+    container:
+      image: ${{ matrix.image }}
+      # the opensuse/tumbleweed image has no PATH in its config, so the runner
+      # would give later steps only the GITHUB_PATH entries (cargo: exit 127)
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     strategy:
       fail-fast: false
       matrix:
@@ -81,3 +86,14 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: target/${{ matrix.target }}/release/mangowm-mod --help
+
+  gui:
+    name: gui (fedora)
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install prerequisites
+        run: dnf install -y gcc git gtk4-devel libadwaita-devel pkgconf-pkg-config rust cargo
+      - uses: actions/checkout@v5
+      - run: cargo build --features gui
+      - run: cargo test --features gui

@@ -13,6 +13,11 @@ repository = "https://github.com/danielaufnahme-cmd/mangowm-mod"
 name = "mangowm-mod"
 path = "src/main.rs"
 
+[[bin]]
+name = "mangowm-mod-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
 [lib]
 name = "mangowm_mod"
 path = "src/lib.rs"
@@ -26,6 +31,13 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 colored = "2.1"
 anyhow = "1.0"
+# GTK4 / libadwaita settings window (`--features gui`); never part of the CLI build.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"], optional = true }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"], optional = true }
+
+[features]
+default = []
+gui = ["dep:gtk", "dep:adw"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

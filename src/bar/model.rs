@@ -9,8 +9,45 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use super::options::{find_opt, parse_opt_value};
 use crate::core::fsutil::{atomic_write, read_text};
 use crate::core::values::parse_color;
+
+/// Keys `BarConfig::set` takes for the bar's own fields.
+pub const BAR_FIELDS: &[&str] = &[
+    "backend",
+    "height",
+    "layer",
+    "position",
+    "output",
+    "margin-top",
+    "margin-bottom",
+    "margin-left",
+    "margin-right",
+    "spacing",
+    "font",
+    "font-size",
+    "font-weight",
+    "radius",
+    "bg",
+    "fg",
+    "accent",
+    "module-bg",
+    "hover",
+    "urgent",
+    "inactive",
+    "border-width",
+    "border-color",
+    "module-padding",
+    "module-margin",
+    "module-gap",
+    "module-radius",
+    "left",
+    "center",
+    "right",
+    "waybar-mango-modules",
+    "start-at-login",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -82,6 +119,7 @@ pub const MANGOBAR_MODULE_KEYS: &[&str] = &[
     "overview-label",
     "pinned",
     "scroll-step",
+    "signal",
     "signal-icons",
     "smooth-scrolling-threshold",
     "spacing",
@@ -97,6 +135,14 @@ pub const MANGOBAR_BAR_KEYS: &[&str] = &[
 ];
 
 pub const LAYERS: &[&str] = &["top", "bottom", "overlay"];
+
+/// Waybar only: Mangobar always sits at the top (mangobar `bar_create_surface`).
+pub const POSITIONS: &[&str] = &["top", "bottom"];
+
+/// Font weights; the generator writes fcft styles (Mangobar) or CSS weights.
+pub const FONT_WEIGHTS: &[&str] = &["normal", "medium", "semibold", "bold"];
+
+pub const SECTIONS: &[&str] = &["left", "center", "right"];
 
 pub fn module_base(name: &str) -> &str {
     name.split('#').next().unwrap_or(name)
@@ -133,14 +179,7 @@ fn default_center() -> Vec<String> {
     vec!["clock".into()]
 }
 fn default_right() -> Vec<String> {
-    [
-        "cpu",
-        "memory",
-        "backlight",
-        "pulseaudio",
-        "battery",
-        "tray",
-    ]
+    ["tray", "cpu", "memory", "network", "pulseaudio"]
     .iter()
     .map(|s| s.to_string())
     .collect()
@@ -160,6 +199,75 @@ impl BarModules {
     pub fn all(&self) -> impl Iterator<Item = &String> {
         self.left.iter().chain(&self.center).chain(&self.right)
     }
+
+    pub fn section(&self, section: &str) -> Result<&Vec<String>> {
+        match section {
+            "left" => Ok(&self.left),
+            "center" => Ok(&self.center),
+            "right" => Ok(&self.right),
+            _ => bail!("bar section must be left, center or right"),
+        }
+    }
+
+    pub fn section_mut(&mut self, section: &str) -> Result<&mut Vec<String>> {
+        match section {
+            "left" => Ok(&mut self.left),
+            "center" => Ok(&mut self.center),
+            "right" => Ok(&mut self.right),
+            _ => bail!("bar section must be left, center or right"),
+        }
+    }
+
+    /// Append a module to a section. A module can be in the bar only once
+    /// (its options are shared).
+    pub fn add(&mut self, section: &str, name: &str) -> Result<()> {
+        let name = name.trim();
+        if !is_known_module(name) {
+            bail!(
+                "unknown bar module {:?}: run `mangowm-mod bar modules` for the list",
+                name
+            );
+        }
+        if self.all().any(|m| m == name) {
+            bail!("{} is already in the bar", name);
+        }
+        self.section_mut(section)?.push(name.to_string());
+        Ok(())
+    }
+
+    pub fn remove(&mut self, section: &str, index: usize) -> Result<String> {
+        let list = self.section_mut(section)?;
+        if index >= list.len() {
+            bail!("no module #{} in the {} section", index + 1, section);
+        }
+        Ok(list.remove(index))
+    }
+
+    /// Move a module one place up (towards the start) or down; at either end
+    /// it moves into the neighbouring section.
+    pub fn shift(&mut self, section: &str, index: usize, up: bool) -> Result<()> {
+        let pos = SECTIONS
+            .iter()
+            .position(|s| *s == section)
+            .context("bar section must be left, center or right")?;
+        let len = self.section(section)?.len();
+        if index >= len {
+            bail!("no module #{} in the {} section", index + 1, section);
+        }
+        let list = self.section_mut(section)?;
+        if up && index > 0 {
+            list.swap(index, index - 1);
+        } else if !up && index + 1 < len {
+            list.swap(index, index + 1);
+        } else if up && pos > 0 {
+            let m = list.remove(index);
+            self.section_mut(SECTIONS[pos - 1])?.push(m);
+        } else if !up && pos + 1 < SECTIONS.len() {
+            let m = list.remove(index);
+            self.section_mut(SECTIONS[pos + 1])?.insert(0, m);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -177,18 +285,70 @@ pub struct BarConfig {
     pub fg_color: String,
     #[serde(default = "default_accent")]
     pub accent_color: String,
+    /// Bar corner radius; -1 = pill.
     #[serde(default = "default_radius")]
-    pub radius: u32,
+    pub radius: i32,
+    /// Font families, comma-separated (Mangobar uses one, see the generator).
     #[serde(default = "default_font")]
     pub font: String,
     #[serde(default = "default_font_size")]
     pub font_size: u32,
+    #[serde(default = "default_font_weight")]
+    pub font_weight: String,
     #[serde(default = "default_layer")]
     pub layer: String,
-    /// Waybar only: use Waybar's `mango/*` modules (added to Waybar after
-    /// 0.15.0). When false, workspaces use `ext/workspaces` and the other
-    /// Mango-only modules are left out.
+    /// Waybar only.
+    #[serde(default = "default_position")]
+    pub position: String,
+    /// Gap between the bar and the screen edges. Mangobar has no bottom margin.
+    #[serde(default = "default_margin_top")]
+    pub margin_top: u32,
+    #[serde(default)]
+    pub margin_bottom: u32,
+    #[serde(default = "default_margin_side")]
+    pub margin_left: u32,
+    #[serde(default = "default_margin_side")]
+    pub margin_right: u32,
+    /// Waybar `spacing`: gap between modules (Mangobar uses `module_gap`).
+    #[serde(default = "default_spacing")]
+    pub spacing: u32,
+    /// Monitors the bar is shown on; empty = all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output: Vec<String>,
+    #[serde(default = "default_module_bg")]
+    pub module_bg_color: String,
+    #[serde(default = "default_hover")]
+    pub hover_color: String,
+    #[serde(default = "default_urgent")]
+    pub urgent_color: String,
+    /// Text of empty / inactive tags.
+    #[serde(default = "default_inactive")]
+    pub inactive_color: String,
+    /// Horizontal padding inside a module.
+    #[serde(default = "default_module_padding")]
+    pub module_padding: u32,
+    /// Space above and below each module.
+    #[serde(default = "default_module_margin")]
+    pub module_margin: u32,
+    /// Space left and right of each module.
+    #[serde(default = "default_module_gap")]
+    pub module_gap: u32,
+    /// Module corner radius; -1 = pill.
+    #[serde(default = "default_module_radius")]
+    pub module_radius: i32,
+    /// Waybar only (Mangobar draws no bar border).
+    #[serde(default = "default_border_width")]
+    pub border_width: u32,
+    #[serde(default = "default_border_color")]
+    pub border_color: String,
+    /// Start this bar when Mango starts (exec_once in mango-mod.conf).
     #[serde(default = "default_true")]
+    pub start_at_login: bool,
+    /// Waybar only: use Waybar's `mango/*` modules (added to Waybar after
+    /// 0.15.0). When false, workspaces use `ext/workspaces`, the window title
+    /// a `custom/window` reading `mmsg`, and the other Mango-only modules are
+    /// left out.
+    #[serde(default)]
     pub waybar_mango_modules: bool,
     /// Extra top-level config keys (e.g. "sys-interval", Waybar "position").
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -201,23 +361,69 @@ pub struct BarConfig {
 /// Kept for compatibility with mangowm-mod 1.0.
 pub type Mangobar = BarConfig;
 
+// Defaults follow the floating teal Waybar of ~/.config/waybar (2026-10).
 fn default_height() -> u32 {
-    32
+    34
 }
 fn default_bg() -> String {
-    "#1e1e2eeb".to_string()
+    "#131316b8".to_string()
 }
 fn default_fg() -> String {
-    "#cdd6f4ff".to_string()
+    "#e5e1e5ff".to_string()
 }
 fn default_accent() -> String {
-    "#89b4faff".to_string()
+    "#76ccb1ff".to_string()
 }
-fn default_radius() -> u32 {
-    10
+fn default_radius() -> i32 {
+    14
 }
 fn default_font() -> String {
-    "JetBrainsMono Nerd Font".to_string()
+    "Adwaita Sans, JetBrainsMono Nerd Font".to_string()
+}
+fn default_font_weight() -> String {
+    "normal".to_string()
+}
+fn default_position() -> String {
+    "top".to_string()
+}
+fn default_margin_top() -> u32 {
+    8
+}
+fn default_margin_side() -> u32 {
+    12
+}
+fn default_spacing() -> u32 {
+    6
+}
+fn default_module_bg() -> String {
+    "#ffffff0f".to_string()
+}
+fn default_hover() -> String {
+    "#ffffff1a".to_string()
+}
+fn default_urgent() -> String {
+    "#e06c75ff".to_string()
+}
+fn default_inactive() -> String {
+    "#9a98a0ff".to_string()
+}
+fn default_module_padding() -> u32 {
+    10
+}
+fn default_module_margin() -> u32 {
+    5
+}
+fn default_module_gap() -> u32 {
+    2
+}
+fn default_module_radius() -> i32 {
+    9
+}
+fn default_border_width() -> u32 {
+    1
+}
+fn default_border_color() -> String {
+    "#ffffff0f".to_string()
 }
 fn default_font_size() -> u32 {
     13
@@ -241,8 +447,27 @@ impl Default for BarConfig {
             radius: default_radius(),
             font: default_font(),
             font_size: default_font_size(),
+            font_weight: default_font_weight(),
             layer: default_layer(),
-            waybar_mango_modules: true,
+            position: default_position(),
+            margin_top: default_margin_top(),
+            margin_bottom: 0,
+            margin_left: default_margin_side(),
+            margin_right: default_margin_side(),
+            spacing: default_spacing(),
+            output: Vec::new(),
+            module_bg_color: default_module_bg(),
+            hover_color: default_hover(),
+            urgent_color: default_urgent(),
+            inactive_color: default_inactive(),
+            module_padding: default_module_padding(),
+            module_margin: default_module_margin(),
+            module_gap: default_module_gap(),
+            module_radius: default_module_radius(),
+            border_width: default_border_width(),
+            border_color: default_border_color(),
+            start_at_login: true,
+            waybar_mango_modules: false,
             options: BTreeMap::new(),
             module_options: BTreeMap::new(),
         }
@@ -301,11 +526,25 @@ impl BarConfig {
         if !LAYERS.contains(&self.layer.as_str()) {
             bail!("layer must be one of {}", LAYERS.join(", "));
         }
-        for c in [&self.bg_color, &self.fg_color, &self.accent_color] {
+        if !POSITIONS.contains(&self.position.as_str()) {
+            bail!("position must be one of {}", POSITIONS.join(", "));
+        }
+        if !FONT_WEIGHTS.contains(&self.font_weight.as_str()) {
+            bail!("font weight must be one of {}", FONT_WEIGHTS.join(", "));
+        }
+        if self.radius < -1 || self.module_radius < -1 {
+            bail!("corner radius must be 0 or more (-1 = pill)");
+        }
+        for c in self.colors() {
             normalize_color(c)?;
         }
-        if self.font.contains(['"', '\n', ';', '}']) {
-            bail!("font name must not contain quotes, ';' or '}}'");
+        if self.font.contains(['"', '\'', '\n', ';', '}', '{']) {
+            bail!("font name must not contain quotes, ';' or braces");
+        }
+        for o in &self.output {
+            if o.is_empty() || o.contains(['"', '\n', ',']) {
+                bail!("invalid output name {:?}", o);
+            }
         }
         for m in self.modules.all() {
             if !is_known_module(m) {
@@ -315,21 +554,81 @@ impl BarConfig {
         Ok(())
     }
 
-    /// Set one bar option. `key` is a bar field (height, radius, bg, fg, accent,
-    /// font, font-size, layer, backend, left, center, right), a top-level config
-    /// key, or `<module>.<option>`.
+    fn colors(&self) -> [&String; 8] {
+        [
+            &self.bg_color,
+            &self.fg_color,
+            &self.accent_color,
+            &self.module_bg_color,
+            &self.hover_color,
+            &self.urgent_color,
+            &self.inactive_color,
+            &self.border_color,
+        ]
+    }
+
+    /// Set one bar option. `key` is a bar field (see [`BAR_FIELDS`]), a
+    /// top-level config key, or `<module>.<option>`. Nothing changes on error.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        let before = self.clone();
+        let res = self.set_unchecked(key, value);
+        if res.is_err() {
+            *self = before;
+        }
+        res
+    }
+
+    fn set_unchecked(&mut self, key: &str, value: &str) -> Result<()> {
+        let num = |what: &str| -> Result<u32> {
+            value
+                .trim()
+                .parse()
+                .with_context(|| format!("{} must be a whole number of 0 or more", what))
+        };
+        let radius = || -> Result<i32> {
+            match value.trim() {
+                "pill" => Ok(-1),
+                v => v.parse().context("radius must be a number (-1 or pill = pill)"),
+            }
+        };
         match key {
-            "height" => self.height = value.trim().parse().context("height must be a number")?,
-            "radius" => self.radius = value.trim().parse().context("radius must be a number")?,
+            "height" => self.height = num("height")?,
+            "radius" => self.radius = radius()?,
             "bg" | "bg_color" | "background" => self.bg_color = normalize_color(value)?,
             "fg" | "fg_color" | "foreground" => self.fg_color = normalize_color(value)?,
             "accent" | "accent_color" => self.accent_color = normalize_color(value)?,
+            "module-bg" => self.module_bg_color = normalize_color(value)?,
+            "hover" => self.hover_color = normalize_color(value)?,
+            "urgent" => self.urgent_color = normalize_color(value)?,
+            "inactive" => self.inactive_color = normalize_color(value)?,
+            "border-color" => self.border_color = normalize_color(value)?,
+            "border-width" => self.border_width = num("border width")?,
             "font" => self.font = value.trim().to_string(),
-            "font-size" | "font_size" => {
-                self.font_size = value.trim().parse().context("font size must be a number")?
-            }
+            "font-size" | "font_size" => self.font_size = num("font size")?,
+            "font-weight" => self.font_weight = value.trim().to_string(),
             "layer" => self.layer = value.trim().to_string(),
+            "position" => self.position = value.trim().to_string(),
+            "margin-top" => self.margin_top = num("margin")?,
+            "margin-bottom" => self.margin_bottom = num("margin")?,
+            "margin-left" => self.margin_left = num("margin")?,
+            "margin-right" => self.margin_right = num("margin")?,
+            "spacing" => self.spacing = num("spacing")?,
+            "module-padding" => self.module_padding = num("module padding")?,
+            "module-margin" => self.module_margin = num("module margin")?,
+            "module-gap" => self.module_gap = num("module gap")?,
+            "module-radius" => self.module_radius = radius()?,
+            "output" => {
+                self.output = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|o| !o.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }
+            "start-at-login" => {
+                self.start_at_login = crate::core::values::parse_bool(value)
+                    .context("start-at-login must be true or false")?
+            }
             "backend" => {
                 self.backend = match value.trim() {
                     "mangobar" => Backend::Mangobar,
@@ -356,16 +655,21 @@ impl BarConfig {
                             MANGOBAR_MODULE_KEYS.join(", ")
                         );
                     }
+                    // known options get their type, so a format "{}" stays a string
+                    let parsed = match find_opt(module, opt) {
+                        Some(o) => parse_opt_value(o.kind, value)?,
+                        None => parse_json_value(value),
+                    };
                     self.module_options
                         .entry(module.to_string())
                         .or_default()
-                        .insert(opt.to_string(), parse_json_value(value));
+                        .insert(opt.to_string(), parsed);
                 } else {
                     if self.backend == Backend::Mangobar && !MANGOBAR_BAR_KEYS.contains(&key) {
                         bail!(
-                            "unknown bar setting {:?}; use height, radius, bg, fg, accent, font, \
-                             font-size, layer, backend, left, center, right, {} or <module>.<option>",
+                            "unknown bar setting {:?}; use {}, {} or <module>.<option>",
                             key,
+                            BAR_FIELDS.join(", "),
                             MANGOBAR_BAR_KEYS.join(", ")
                         );
                     }

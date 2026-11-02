@@ -1,5 +1,7 @@
 pub mod generate;
+pub mod login;
 pub mod model;
+pub mod options;
 pub mod process;
 
 pub use generate::{

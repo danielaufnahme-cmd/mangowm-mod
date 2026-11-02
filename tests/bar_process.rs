@@ -5,7 +5,7 @@
 
 use mangowm_mod::bar::generate::write_bar_files;
 use mangowm_mod::bar::model::BarConfig;
-use mangowm_mod::bar::process::{pid_file, start_bar, stop_bar};
+use mangowm_mod::bar::process::{foreign_bars, pid_file, start_bar, stop_bar, stop_foreign};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -55,7 +55,9 @@ fn test_start_stop_fake_bar() {
     std::env::set_var("PATH", &bin);
     let err = start_bar(&bar, Some(&out), &data).unwrap_err().to_string();
     assert!(
-        err.contains("not found in PATH") && err.contains("build it from source"),
+        err.contains("not found in PATH")
+            && err.contains("build it from source")
+            && err.contains("https://github.com/mangowm/mangobar"),
         "{}",
         err
     );
@@ -74,6 +76,26 @@ fn test_start_stop_fake_bar() {
 
     let pid_path = pid_file(&data);
     assert_eq!(pid_path, run.join("mangowm-mod/bar.pid"));
+
+    // a bar that dies on startup (like mangobar on a config error) is an
+    // error with its last log line, not a "started" message
+    let crash = bin.join("crashbar");
+    fs::write(
+        &crash,
+        "#!/bin/sh\necho 'mangobar: config error: bad json' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&crash, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&fake, bin.join("mangobar.keep")).unwrap();
+    fs::rename(&crash, &fake).unwrap();
+    let err = start_bar(&bar, Some(&out), &data).unwrap_err().to_string();
+    assert!(
+        err.contains("exited right after starting") && err.contains("config error: bad json"),
+        "{}",
+        err
+    );
+    assert!(!pid_path.exists());
+    fs::rename(bin.join("mangobar.keep"), &fake).unwrap();
     let pid = start_bar(&bar, Some(&out), &data).unwrap();
     assert_eq!(
         fs::read_to_string(&pid_path).unwrap(),
@@ -114,4 +136,28 @@ fn test_start_stop_fake_bar() {
     fs::write(&pid_path, format!("{} mangobar\n", std::process::id())).unwrap();
     assert_eq!(stop_bar(&bar, Some(&out), &data).unwrap(), None);
     assert!(!pid_path.exists());
+
+    // a bar started outside mangowm-mod (like exec_once=waybar) is found,
+    // ours is not; only the fake is ever stopped (a real Waybar may be running)
+    let pid4 = start_bar(&bar, Some(&out), &data).unwrap();
+    let user_bar = bin.join("waybar");
+    fs::copy(&fake, &user_bar).unwrap();
+    let mut child = std::process::Command::new(&user_bar)
+        .arg("-c")
+        .arg(tmp.path().join("user-waybar.jsonc"))
+        .spawn()
+        .unwrap();
+    let fake_pid = child.id();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let found = foreign_bars(&bar, &data);
+    assert!(!found.iter().any(|b| b.pid == pid4), "{:?}", found);
+    let mine: Vec<_> = found.into_iter().filter(|b| b.pid == fake_pid).collect();
+    assert_eq!(mine.len(), 1, "fake waybar not found");
+    assert_eq!(mine[0].binary, "waybar");
+    assert!(mine[0].command.contains("user-waybar.jsonc"));
+    let msgs = stop_foreign(&mine).unwrap();
+    assert_eq!(msgs.len(), 1, "{:?}", msgs);
+    child.wait().unwrap();
+    assert!(stop_bar(&bar, Some(&out), &data).unwrap().is_some());
+    assert!(wait_dead(pid4));
 }

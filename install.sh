@@ -1,6 +1,10 @@
 #!/bin/sh
-# MangoWM Mod installer (user-local, never uses sudo, never edits shell rc files).
-# Builds from source with cargo, or installs a verified prebuilt static binary.
+# MangoWM Mod installer (user-local, never edits shell rc files).
+# Builds from source with cargo (CLI + GTK4/libadwaita GUI when the dev packages
+# are present), or installs a verified prebuilt static CLI binary.
+# Never uses sudo on its own: if the GTK dev packages are missing it prints the
+# install command and only runs it after you answer y (never with --yes or
+# without a terminal).
 # Works from inside a clone, or piped: curl -fsSL <url>/install.sh | sh
 set -eu
 
@@ -10,9 +14,12 @@ DOWNLOAD_BASE="${MANGOWM_MOD_DOWNLOAD_BASE:-}"
 MIN_MAJOR=1
 MIN_MINOR=80
 MODE=auto # auto | source | prebuilt
+WANT_GUI=1
 VERSION=""
 ASSUME_YES=0
 TMP_DIR=""
+GUI_DONE=0
+SRC_DIR=""
 
 usage() {
   cat <<EOF
@@ -22,6 +29,7 @@ Usage: install.sh [options]
   --source          build from source with cargo
   --version vX.Y.Z  prebuilt: install this release instead of the latest
   --bin-dir DIR     install into DIR (default: \$HOME/.local/bin)
+  --no-gui          install only the CLI (skip the GTK4 GUI and launcher entry)
   --yes             never prompt
   --help            show this help
 
@@ -50,6 +58,7 @@ while [ $# -gt 0 ]; do
     --prebuilt) MODE=prebuilt ;;
     --source) MODE=source ;;
     --yes | -y) ASSUME_YES=1 ;;
+    --no-gui) WANT_GUI=0 ;;
     --version)
       [ $# -ge 2 ] || die "--version needs a value (e.g. v0.1.0)"
       VERSION="$2"
@@ -152,6 +161,69 @@ confirm() {
   esac
 }
 
+# y/N question; default no, and no when --yes or no terminal is available
+confirm_no() {
+  [ "$ASSUME_YES" -eq 1 ] && return 1
+  if ! (: </dev/tty) 2>/dev/null; then return 1; fi
+  printf '%s [y/N] ' "$1" >/dev/tty
+  _a=""
+  read -r _a </dev/tty || _a=""
+  case "$_a" in
+    y | Y | yes | YES | Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# True when the GTK4 and libadwaita development files are installed
+gtk_ok() {
+  have pkg-config && pkg-config --exists gtk4 libadwaita-1
+}
+
+# Print the command that installs the GTK4/libadwaita dev packages (empty: unknown distro)
+gtk_install_cmd() {
+  _ids=""
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091 # system file
+    _ids="$(. /etc/os-release && printf '%s %s' "${ID:-}" "${ID_LIKE:-}")"
+  fi
+  _pc=""
+  have pkg-config || _pc=1
+  case " $_ids " in
+    *" fedora "* | *" rhel "*) printf 'sudo dnf install gtk4-devel libadwaita-devel%s' "${_pc:+ pkgconf-pkg-config}" ;;
+    *" arch "*) printf 'sudo pacman -S gtk4 libadwaita%s' "${_pc:+ pkgconf}" ;;
+    *" debian "* | *" ubuntu "*) printf 'sudo apt install libgtk-4-dev libadwaita-1-dev%s' "${_pc:+ pkg-config}" ;;
+    *" opensuse"* | *" suse "*) printf 'sudo zypper install gtk4-devel libadwaita-devel%s' "${_pc:+ pkg-config}" ;;
+    *" alpine "*) printf 'doas apk add gtk4.0-dev libadwaita-dev%s' "${_pc:+ pkgconf}" ;;
+    *" void "*) printf 'sudo xbps-install -S gtk4-devel libadwaita-devel%s' "${_pc:+ pkg-config}" ;;
+    *" gentoo "*) printf 'sudo emerge --ask gui-libs/gtk gui-libs/libadwaita' ;; # unverified
+    *" nixos "*) printf 'nix-shell -p gtk4 libadwaita pkg-config' ;; # unverified; add them to your config for permanence
+    *) ;;
+  esac
+}
+
+# Make sure the GTK dev packages exist; offers to install them (default no). Returns 1 if still missing.
+ensure_gtk() {
+  gtk_ok && return 0
+  _cmd="$(gtk_install_cmd)"
+  say ""
+  say "The GUI needs the GTK4 and libadwaita development packages (not found)."
+  if [ -z "$_cmd" ]; then
+    say "Install gtk4 and libadwaita dev files (and pkg-config) with your package manager."
+    return 1
+  fi
+  say "  $_cmd"
+  case "$_cmd" in
+    sudo\ dnf* | sudo\ pacman* | sudo\ apt* | sudo\ zypper* | sudo\ xbps-install*)
+      if confirm_no "Install them now with sudo?"; then
+        # shellcheck disable=SC2086 # intentional word splitting of the command
+        if $_cmd && gtk_ok; then return 0; fi
+        err "Package install did not complete."
+      fi
+      ;;
+  esac
+  return 1
+}
+
 fetch() { # fetch URL DEST
   if have curl; then
     curl -fsSL -o "$2" "$1"
@@ -178,12 +250,47 @@ mk_tmp() {
   if [ -z "$TMP_DIR" ]; then TMP_DIR="$(mktemp -d)"; fi
 }
 
-# Copy a binary into BIN_DIR (atomic replace, mode 755)
+# Copy a binary ($1) into BIN_DIR as name $2 (atomic replace, mode 755)
 place_binary() {
   mkdir -p "$BIN_DIR"
-  cp "$1" "$BIN_DIR/.mangowm-mod.new"
-  chmod 755 "$BIN_DIR/.mangowm-mod.new"
-  mv -f "$BIN_DIR/.mangowm-mod.new" "$BIN_DIR/mangowm-mod"
+  cp "$1" "$BIN_DIR/.$2.new"
+  chmod 755 "$BIN_DIR/.$2.new"
+  mv -f "$BIN_DIR/.$2.new" "$BIN_DIR/$2"
+}
+
+# Install the launcher entry and icon for the GUI binary at $1
+install_desktop() {
+  _data="${XDG_DATA_HOME:-$HOME/.local/share}"
+  _app="$_data/applications"
+  _icons="$_data/icons/hicolor/scalable/apps"
+  _id="io.github.danielaufnahme_cmd.MangowmMod"
+  _exec="$1"
+  case "$_exec" in *" "*) _exec="\"$_exec\"" ;; esac
+  mkdir -p "$_app" "$_icons"
+  while IFS= read -r _l; do
+    case "$_l" in
+      Exec=*) printf 'Exec=%s\n' "$_exec" ;;
+      *) printf '%s\n' "$_l" ;;
+    esac
+  done <"$SRC_DIR/data/mangowm-mod.desktop" >"$_app/mangowm-mod.desktop.new"
+  mv -f "$_app/mangowm-mod.desktop.new" "$_app/mangowm-mod.desktop"
+  cp "$SRC_DIR/data/$_id.svg" "$_icons/$_id.svg"
+  have update-desktop-database && { update-desktop-database "$_app" >/dev/null 2>&1 || true; }
+  have gtk-update-icon-cache && { gtk-update-icon-cache -q -t -f "$_data/icons/hicolor" >/dev/null 2>&1 || true; }
+  say "✓ Installed launcher entry ($_app/mangowm-mod.desktop)"
+}
+
+# Copy the preset wallpapers to the data dir mangowm-mod reads them from
+install_wallpapers() {
+  [ -n "$SRC_DIR" ] && [ -d "$SRC_DIR/data/wallpapers" ] || return 0
+  _wp="${MANGOWM_MOD_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/mangowm-mod}/wallpapers"
+  mkdir -p "$_wp"
+  for _f in "$SRC_DIR"/data/wallpapers/*.png; do
+    [ -f "$_f" ] || continue
+    cp "$_f" "$_wp/.$(basename "$_f").new"
+    mv -f "$_wp/.$(basename "$_f").new" "$_wp/$(basename "$_f")"
+  done
+  say "✓ Installed preset wallpapers ($_wp)"
 }
 
 # ---- install paths ----
@@ -193,7 +300,6 @@ install_source() {
     print_pkg_help
     exit 1
   }
-  SRC_DIR=""
   # Local checkout? ($0 is just "sh" when piped, so the file test fails)
   if [ -f "$0" ]; then
     _d="$(cd "$(dirname "$0")" && pwd)"
@@ -216,9 +322,26 @@ install_source() {
     fi
     SRC_DIR="$TMP_DIR/mangowm-mod"
   fi
+  # cargo honours CARGO_TARGET_DIR (relative paths are relative to the build dir)
+  case "${CARGO_TARGET_DIR:-}" in
+    "") TARGET_DIR="$SRC_DIR/target" ;;
+    /*) TARGET_DIR="$CARGO_TARGET_DIR" ;;
+    *) TARGET_DIR="$SRC_DIR/$CARGO_TARGET_DIR" ;;
+  esac
+  if [ "$WANT_GUI" -eq 1 ] && [ -f "$SRC_DIR/data/mangowm-mod.desktop" ] && ensure_gtk; then
+    say "==> Building mangowm-mod and mangowm-mod-gui (release)"
+    if (cd "$SRC_DIR" && cargo build --release --locked --features gui) &&
+      [ -f "$TARGET_DIR/release/mangowm-mod-gui" ]; then
+      place_binary "$TARGET_DIR/release/mangowm-mod" mangowm-mod
+      place_binary "$TARGET_DIR/release/mangowm-mod-gui" mangowm-mod-gui
+      GUI_DONE=1
+      return 0
+    fi
+    err "GUI build failed (see the error above; libadwaita needs a recent Rust, yours is $(cargo --version 2>/dev/null || echo unknown)). Installing the CLI only."
+  fi
   say "==> Building mangowm-mod (release)"
   (cd "$SRC_DIR" && cargo build --release --locked)
-  place_binary "$SRC_DIR/target/release/mangowm-mod"
+  place_binary "$TARGET_DIR/release/mangowm-mod" mangowm-mod
 }
 
 install_prebuilt() {
@@ -246,7 +369,7 @@ install_prebuilt() {
   mkdir "$TMP_DIR/x"
   tar -xzf "$TMP_DIR/$asset" -C "$TMP_DIR/x"
   [ -f "$TMP_DIR/x/mangowm-mod" ] || die "Archive does not contain mangowm-mod."
-  place_binary "$TMP_DIR/x/mangowm-mod"
+  place_binary "$TMP_DIR/x/mangowm-mod" mangowm-mod
 }
 
 # ---- decide ----
@@ -275,6 +398,19 @@ else
 fi
 
 say "✓ Installed mangowm-mod to $BIN_DIR/mangowm-mod"
+install_wallpapers
+if [ "$GUI_DONE" -eq 1 ]; then
+  say "✓ Installed mangowm-mod-gui to $BIN_DIR/mangowm-mod-gui"
+  install_desktop "$BIN_DIR/mangowm-mod-gui"
+elif [ "$WANT_GUI" -eq 1 ]; then
+  say ""
+  if [ "$MODE" = prebuilt ]; then
+    say "The GUI is not part of the prebuilt binary; it needs a source build:"
+  else
+    say "Only the CLI was installed. To get the GUI, install the GTK4/libadwaita dev packages and rerun:"
+  fi
+  say "  ./install.sh --source   (or: curl -fsSL $REPO_URL/raw/main/install.sh | sh -s -- --source)"
+fi
 
 # ---- after install ----
 case ":$PATH:" in

@@ -5,7 +5,7 @@
 ![Rust 1.80+](https://img.shields.io/badge/Rust-1.80%2B-dea584?style=flat-square&logo=rust)
 ![License MIT](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)
 
-A command-line tool, written in Rust, that manages [MangoWM](https://github.com/mangowm/mango) settings and builds a Mangobar or Waybar status bar for it. It edits a separate file (`mango-mod.conf`) instead of your handwritten `config.conf`, backs up before every change, and tells Mango to reload. It is a CLI only: there is no GUI and no live preview.
+A command-line tool, written in Rust, that manages [MangoWM](https://github.com/mangowm/mango) settings and builds a Mangobar or Waybar status bar for it. It edits a separate file (`mango-mod.conf`) instead of your handwritten `config.conf`, backs up before every change, and tells Mango to reload. It also ships an optional GTK4/libadwaita settings window (`mangowm-mod-gui`) that uses the same files and backups. There is no live preview.
 
 ## What it covers
 
@@ -15,7 +15,7 @@ A command-line tool, written in Rust, that manages [MangoWM](https://github.com/
 - `window_rule`, `window_rule_once`, `tag_rule`, `layer_rule` and `device_rule`.
 - `monitor_rule` (resolution, position, scale, transform, VRR, disable, primary).
 - `exec_once` / `exec` autostart commands.
-- 6 presets, plus backups and restore.
+- 12 tiling presets, each with its own wallpaper, plus backups and restore.
 - Mangobar and Waybar config and style generation, start and stop, with saved choices.
 
 ## What it does not cover
@@ -35,7 +35,9 @@ Requirements: Linux (it also builds on FreeBSD and OpenBSD; other systems print 
 curl -fsSL https://raw.githubusercontent.com/danielaufnahme-cmd/mangowm-mod/main/install.sh | sh
 ```
 
-The script installs to `~/.local/bin`, never uses sudo, and prints how to add `~/.local/bin` to your `PATH` for bash, zsh and fish. If `cargo` is missing it downloads a prebuilt binary and verifies its SHA-256.
+The script installs to `~/.local/bin` and prints how to add `~/.local/bin` to your `PATH` for bash, zsh and fish. If `cargo` is missing it downloads a prebuilt CLI binary and verifies its SHA-256.
+
+With `cargo` and the GTK4 and libadwaita development packages present, it builds and installs both `mangowm-mod` and `mangowm-mod-gui`, plus a launcher entry (`~/.local/share/applications/mangowm-mod.desktop`, an existing file with that name is replaced) and icon, so the app shows up in your application menu. If those packages are missing, it prints the install command for your distro (for example `sudo dnf install gtk4-devel libadwaita-devel` on Fedora) and asks `Install them now with sudo? [y/N]`. The default is No; sudo runs only if you type `y`. With `--yes`, or without a terminal (as in `curl | sh`), it never runs sudo: it prints the command and installs the CLI only. If the GUI build fails (libadwaita needs a recent Rust), the CLI is still installed. The prebuilt binaries are CLI only; the GUI needs a source build.
 
 | Option | Meaning |
 | --- | --- |
@@ -43,12 +45,13 @@ The script installs to `~/.local/bin`, never uses sudo, and prints how to add `~
 | `--source` | Build from source |
 | `--version vX.Y.Z` | Install a specific release |
 | `--bin-dir DIR` | Install somewhere other than `~/.local/bin` |
-| `--yes` | Do not ask questions |
+| `--no-gui` | Install only the CLI, skip the GUI and launcher entry |
+| `--yes` | Do not ask questions (never runs sudo) |
 | `--help` | Show help |
 
 ### Prebuilt binaries
 
-Static musl binaries for x86_64 and aarch64 are attached to the [GitHub releases](https://github.com/danielaufnahme-cmd/mangowm-mod/releases). CI builds them on version tags.
+Static musl binaries (CLI only, no GUI) for x86_64 and aarch64 are attached to the [GitHub releases](https://github.com/danielaufnahme-cmd/mangowm-mod/releases). CI builds them on version tags.
 
 ### From source
 
@@ -58,6 +61,14 @@ cd mangowm-mod
 cargo build --release
 cargo install --path .
 ```
+
+To include the GUI, install the GTK4 and libadwaita development packages (Fedora: `gtk4-devel libadwaita-devel`, Arch: `gtk4 libadwaita`, Debian/Ubuntu: `libgtk-4-dev libadwaita-1-dev`, openSUSE: `gtk4-devel libadwaita-devel`, Alpine: `gtk4.0-dev libadwaita-dev`, Void: `gtk4-devel libadwaita-devel`) and add the feature flag:
+
+```bash
+cargo install --path . --features gui
+```
+
+`./install.sh` does this for you and also installs the launcher entry.
 
 ### Getting MangoWM, Mangobar and Waybar
 
@@ -117,6 +128,14 @@ mangowm-mod schema --search gap          # search keys and labels
 mangowm-mod preset list                  # list presets
 mangowm-mod preset apply tokyo-night     # by ID or name, applied at once
 ```
+
+### wallpaper
+
+```bash
+mangowm-mod wallpaper set ~/Pictures/Wallpapers/forest.png   # applied at once
+```
+
+Sets the same single `exec_once=swaybg` line presets use, so a preset applied later replaces it. The GUI's Wallpaper page shows the bundled wallpapers, `~/Pictures/Wallpapers`, `~/Pictures/wallpapers` and Plasma's current wallpaper as a thumbnail grid (thumbnails cached in `~/.cache/mangowm-mod/thumbs`).
 
 ### bind
 
@@ -204,7 +223,9 @@ The bar is stopped using a PID file; `pkill -f` matching only the bar the tool s
 
 ## Presets
 
-`clean` (balanced layout, calm blue borders), `tokyo-night` (deep navy, cyan and magenta), `nord` (arctic blues), `gruvbox` (warm amber and orange), `glass` (translucent, deep blur, soft shadow), `zen` (no borders, no gaps, no blur).
+`clean` (calm blue), `tokyo-night` (deep navy, blue and cyan), `nord` (arctic blues), `gruvbox` (warm amber and orange), `glass` (translucent, deep blur), `zen` (no borders, no gaps, no blur), `everforest` (soft greens), `rose-pine` (muted rose and gold), `kanagawa` (ink blue), `solarized` (deep-sea teal), `latte` (light), `graphite` (monochrome).
+
+Every preset is a tiling setup: Mango's `tile` layout on every tag (`tag_rule=id:*,layout_name:tile`, after your own tag rules so it wins) and new windows join the stack (`new_is_master=0`). Each one also sets its own wallpaper: an original, procedurally drawn PNG (`data/wallpapers`, made by `render.py` there) that `install.sh` copies to `~/.local/share/mangowm-mod/wallpapers`. Applying a preset writes `exec_once=swaybg -m fill -i <wallpaper>` to `mango-mod.conf` (replacing any earlier managed swaybg line) and, when Mango confirms the reload, swaps the running swaybg right away. If your `config.conf` starts its own swaybg, remove that line, or at login either wallpaper may end up on top (the tool warns about it).
 
 ## Compatibility notes
 

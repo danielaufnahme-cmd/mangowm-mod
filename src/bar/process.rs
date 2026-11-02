@@ -245,18 +245,154 @@ fn pkill_ours(targets: &[(Backend, PathBuf)]) -> Result<Option<String>> {
     Ok((!stopped.is_empty()).then(|| format!("stopped {}", stopped.join(", "))))
 }
 
+/// A Mangobar or Waybar that MangoWM Mod did not start (e.g. `exec_once=waybar`
+/// in config.conf, or one started from a terminal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignBar {
+    pub pid: u32,
+    pub binary: &'static str,
+    pub command: String,
+}
+
+/// Running bars that are not ours: their program is mangobar or waybar, they
+/// do not run `-c <our config>` and are not in our PID file. Empty without /proc.
+pub fn foreign_bars(bar: &BarConfig, data_dir: &Path) -> Vec<ForeignBar> {
+    let mut out = Vec::new();
+    if !have_proc() {
+        return out;
+    }
+    let started = read_pid_file(&pid_file(data_dir)).map(|(pid, _)| pid);
+    let ours: Vec<String> = our_configs(bar, None)
+        .into_iter()
+        .map(|(_, c)| c.display().to_string())
+        .collect();
+    let me = std::process::id();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me || Some(pid) == started || is_alive(pid) != Some(true) {
+            continue;
+        }
+        let comm = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+        let binary = match comm.trim() {
+            "waybar" => Backend::Waybar.binary(),
+            "mangobar" => Backend::Mangobar.binary(),
+            _ => continue,
+        };
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+        if ours
+            .iter()
+            .any(|cfg| argv_matches(&argv, binary, cfg.as_bytes()))
+        {
+            continue;
+        }
+        let command = argv
+            .iter()
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push(ForeignBar {
+            pid,
+            binary,
+            command,
+        });
+    }
+    out.sort_by_key(|b| b.pid);
+    out
+}
+
+/// Stop bars found by [`foreign_bars`] (only after the user agreed).
+/// A PID that is no longer that bar is skipped.
+pub fn stop_foreign(bars: &[ForeignBar]) -> Result<Vec<String>> {
+    let mut msgs = Vec::new();
+    for b in bars {
+        let comm = fs::read_to_string(format!("/proc/{}/comm", b.pid)).unwrap_or_default();
+        if comm.trim() != b.binary {
+            continue;
+        }
+        if let Some(msg) = stop_pid(b.pid, b.binary)? {
+            msgs.push(msg);
+        }
+    }
+    Ok(msgs)
+}
+
+/// The bar program: `$PATH` first, then the usual install places, since
+/// Mango's login environment may not have ~/.local/bin in `$PATH`.
+pub fn find_bar_binary(backend: Backend) -> Option<PathBuf> {
+    let name = backend.binary();
+    if let Some(p) = find_in_path(name) {
+        return Some(p);
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".local/bin"));
+    }
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    dirs.push(PathBuf::from("/usr/bin"));
+    dirs.into_iter()
+        .map(|d| d.join(name))
+        .find(|p| is_executable(p))
+}
+
+#[cfg(unix)]
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Where to get the bar when its binary is missing (mangobar README, 2026-10).
+fn not_installed(backend: Backend) -> String {
+    match backend {
+        Backend::Mangobar => "`mangobar` was not found in PATH. Mangobar is not in Fedora's or \
+                              Debian's repositories (Arch: AUR mangobar-git); build it from \
+                              source: https://github.com/mangowm/mangobar (meson + ninja, see its \
+                              README), or switch the bar to Waybar"
+            .to_string(),
+        Backend::Waybar => "`waybar` was not found in PATH. Install waybar from your \
+                            distribution's packages or build it from source, then try again"
+            .to_string(),
+    }
+}
+
+/// How long a bar that fails on startup (bad config, no Wayland, missing
+/// font) is given to exit before Start reports success.
+const STARTUP_CHECK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Last non-empty line of the bar log, for the error message.
+fn last_log_line(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
 /// Start the bar with the files in `dir` (default [`bar_dir`]), stopping
 /// our previous instance first. Returns the new PID.
 pub fn start_bar(bar: &BarConfig, dir: Option<&Path>, data_dir: &Path) -> Result<u32> {
     let binary = bar.backend.binary();
-    if find_in_path(binary).is_none() {
-        bail!(
-            "`{}` was not found in PATH. Install {} from your distribution's packages or build \
-             it from source, then try again",
-            binary,
-            binary
-        );
-    }
+    let Some(program) = find_bar_binary(bar.backend) else {
+        bail!(not_installed(bar.backend));
+    };
     let out_dir = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| bar_dir(bar.backend));
@@ -287,7 +423,7 @@ pub fn start_bar(bar: &BarConfig, dir: Option<&Path>, data_dir: &Path) -> Result
         .with_context(|| format!("failed to open {}", log_path.display()))?;
     let log_err = log.try_clone()?;
 
-    let mut cmd = Command::new(binary);
+    let mut cmd = Command::new(&program);
     cmd.arg("-c")
         .arg(&cfg)
         .arg("-s")
@@ -301,10 +437,29 @@ pub fn start_bar(bar: &BarConfig, dir: Option<&Path>, data_dir: &Path) -> Result
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = cmd
+    let log_len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("failed to start {}: {}", binary, e))?;
     let pid = child.id();
+
+    // mangobar exits right away on a config error or a missing font; say so
+    // instead of reporting a bar that is already gone.
+    let started = std::time::Instant::now();
+    while started.elapsed() < STARTUP_CHECK {
+        if let Some(status) = child.try_wait()? {
+            let new_log = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0) > log_len;
+            let reason = new_log.then(|| last_log_line(&log_path)).flatten();
+            bail!(
+                "{} exited right after starting ({}){}; log: {}",
+                binary,
+                status,
+                reason.map(|r| format!(": {}", r)).unwrap_or_default(),
+                log_path.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 
     let pid_path = pid_file(data_dir);
     atomic_write(&pid_path, &format!("{} {}\n", pid, binary)).with_context(|| {
