@@ -5,7 +5,9 @@
 
 use mangowm_mod::bar::generate::write_bar_files;
 use mangowm_mod::bar::model::BarConfig;
-use mangowm_mod::bar::process::{foreign_bars, pid_file, start_bar, stop_bar, stop_foreign};
+use mangowm_mod::bar::process::{
+    foreign_bars, our_bar_running, pid_file, start_bar, stop_bar, stop_foreign,
+};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -44,6 +46,8 @@ fn test_start_stop_fake_bar() {
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&run).unwrap();
     std::env::set_var("XDG_RUNTIME_DIR", &run);
+    // find_bar_binary also looks in ~/.local/bin: keep a real install out of it
+    std::env::set_var("HOME", tmp.path());
     std::env::set_var("MANGOBAR_MOD_DIR", tmp.path().join("mangobar-mod"));
     std::env::set_var("WAYBAR_MOD_DIR", tmp.path().join("waybar-mod"));
 
@@ -111,6 +115,8 @@ fn test_start_stop_fake_bar() {
     assert!(wait_dead(pid));
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(alive(pid2));
+    // the GUI restarts a running bar after a preset
+    assert!(our_bar_running(&data));
 
     let msg = stop_bar(&bar, Some(&out), &data).unwrap().unwrap();
     assert!(msg.contains(&pid2.to_string()), "{}", msg);

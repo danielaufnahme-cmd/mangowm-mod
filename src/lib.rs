@@ -1,6 +1,7 @@
 pub mod bar;
 pub mod cli;
 pub mod core;
+pub mod palette;
 pub mod presets;
 pub mod wallpaper;
 

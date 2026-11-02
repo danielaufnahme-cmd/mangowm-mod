@@ -1,5 +1,7 @@
 //! Wallpaper page: pick Mango's wallpaper from a thumbnail grid. Like a
 //! preset, a pick is applied at once (the single managed swaybg line).
+//! Above the grid, "Match colours" colours the window borders and the bar
+//! after the wallpaper (src/palette.rs).
 
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
@@ -11,9 +13,14 @@ use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::gdk_pixbuf::Pixbuf;
 use gtk::{gio, glib};
 
+use mangowm_mod::bar::generate::bar_dir;
+use mangowm_mod::palette::{
+    apply_bar_colors, palette_from_file, restart_bar_if_running, stage_window_colors,
+    MatchSettings, Palette,
+};
 use mangowm_mod::wallpaper::{
-    bundled_dir, collect_wallpapers, mango_wallpaper, plasma_wallpaper_in, set_wallpaper,
-    WallpaperEntry,
+    bundled_dir, collect_wallpapers, current_wallpaper, mango_wallpaper, plasma_wallpaper_in,
+    set_wallpaper, WallpaperEntry,
 };
 
 use crate::ctx::Ctx;
@@ -124,12 +131,61 @@ struct Card {
 }
 
 fn apply(ctx: &Ctx, parent: &gtk::Widget, path: &Path) {
+    let auto = MatchSettings::load(&ctx.data_dir);
+    if !auto.auto || !(auto.windows || auto.bar) {
+        set_now(ctx, parent, path, None);
+        return;
+    }
+    // match the colours too: read the picture off the main thread first
+    let (ctx, parent, path) = (ctx.clone(), parent.clone(), path.to_path_buf());
+    glib::spawn_future_local(async move {
+        let p = path.clone();
+        let palette = match gio::spawn_blocking(move || palette_from_file(&p)).await {
+            Ok(Ok(palette)) => Some(palette),
+            Ok(Err(e)) => {
+                ctx.toast(&format!("Colours: {:#}", e));
+                None
+            }
+            Err(_) => None,
+        };
+        let colors = palette.map(|p| (p, auto));
+        set_now(&ctx, &parent, &path, colors.as_ref());
+    });
+}
+
+/// Set the wallpaper; with `colors`, also its matched window colours (staged
+/// first, so the same apply writes them) and bar colours.
+fn set_now(ctx: &Ctx, parent: &gtk::Widget, path: &Path, colors: Option<&(Palette, MatchSettings)>) {
+    let mut what = "Wallpaper set";
+    if let Some((palette, _)) = colors.filter(|(_, c)| c.windows) {
+        let staged = stage_window_colors(&mut ctx.mgr.borrow_mut(), palette);
+        match staged {
+            Ok(()) => what = "Wallpaper and window colours set",
+            Err(e) => ctx.toast(&format!("Window colours: {:#}", e)),
+        }
+    }
     let res = set_wallpaper(&mut ctx.mgr.borrow_mut(), path);
     match res {
-        Ok(r) => report_apply(ctx, parent, &r, Some("Wallpaper set")),
+        Ok(r) => report_apply(ctx, parent, &r, Some(what)),
         Err(e) => ctx.toast(&format!("Wallpaper: {:#}", e)),
     }
+    if let Some((palette, _)) = colors.filter(|(_, c)| c.bar) {
+        bar_colors(ctx, palette);
+    }
     ctx.changed();
+}
+
+/// Save the bar colours, write its files and restart it if it runs.
+fn bar_colors(ctx: &Ctx, palette: &Palette) {
+    let res = apply_bar_colors(palette, &ctx.data_dir, None).and_then(|bar| {
+        let dir = bar_dir(bar.backend);
+        restart_bar_if_running(&bar, Some(&dir), &ctx.data_dir)
+    });
+    match res {
+        Ok(Some(_)) => ctx.toast("Bar colours set · bar restarted"),
+        Ok(None) => ctx.toast("Bar colours set"),
+        Err(e) => ctx.toast(&format!("Bar colours: {:#}", e)),
+    }
 }
 
 /// Apply at once; ask first only when other staged changes would go with it.
@@ -189,6 +245,262 @@ fn card(ctx: &Ctx, e: &WallpaperEntry) -> Card {
     }
 }
 
+/// One colour of the palette strip: a rounded swatch over its role name.
+fn swatch(name: &str, color: Option<mangowm_mod::palette::Rgb>) -> gtk::Box {
+    let area = gtk::DrawingArea::builder()
+        .content_height(40)
+        .hexpand(true)
+        .build();
+    area.set_draw_func(move |_, cr, w, h| {
+        rounded_rect(cr, 0.0, 0.0, w as f64, h as f64, 8.0);
+        match color {
+            Some(c) => cr.set_source_rgb(c.r as f64 / 255.0, c.g as f64 / 255.0, c.b as f64 / 255.0),
+            None => cr.set_source_rgba(0.5, 0.5, 0.5, 0.12),
+        }
+        let _ = cr.fill_preserve();
+        // a faint edge, so a swatch close to the window colour still shows
+        cr.set_source_rgba(0.5, 0.5, 0.5, 0.25);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+    });
+    let bx = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .hexpand(true)
+        .css_classes(["palette-swatch"])
+        .build();
+    if let Some(c) = color {
+        bx.set_tooltip_text(Some(&format!("{} {}", name, c.hex())));
+    }
+    bx.append(&area);
+    bx.append(
+        &gtk::Label::builder()
+            .label(name)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["caption", "dim-label"])
+            .build(),
+    );
+    bx
+}
+
+/// "Match colours to wallpaper": the palette of Mango's wallpaper (else
+/// Plasma's), what to colour, and the button that does it.
+struct Matcher {
+    ctx: Ctx,
+    group: adw::PreferencesGroup,
+    strip: gtk::Box,
+    windows: adw::SwitchRow,
+    bar: adw::SwitchRow,
+    auto: adw::SwitchRow,
+    button: gtk::Button,
+    /// Picture the strip shows and its palette (None while reading or on error).
+    shown: RefCell<Option<PathBuf>>,
+    palette: RefCell<Option<Palette>>,
+}
+
+impl Matcher {
+    fn new(ctx: &Ctx) -> Rc<Self> {
+        let saved = MatchSettings::load(&ctx.data_dir);
+        let button = gtk::Button::builder()
+            .label("Apply Colours")
+            .valign(gtk::Align::Center)
+            .sensitive(false)
+            .css_classes(["suggested-action"])
+            .build();
+        let group = adw::PreferencesGroup::builder()
+            .title("Match Colours to Wallpaper")
+            .description("No wallpaper found")
+            .header_suffix(&button)
+            .build();
+        let strip = gtk::Box::builder()
+            .spacing(8)
+            .homogeneous(true)
+            .margin_top(12)
+            .margin_bottom(10)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        let strip_row = adw::PreferencesRow::builder()
+            .activatable(false)
+            .focusable(false)
+            .child(&strip)
+            .build();
+        group.add(&strip_row);
+        let windows = adw::SwitchRow::builder()
+            .title("Window borders")
+            .subtitle("Focused border in the accent, the others from the palette (staged, then applied)")
+            .active(saved.windows)
+            .build();
+        let bar = adw::SwitchRow::builder()
+            .title("Bar")
+            .subtitle("Bar colours; the bar is restarted if it is running")
+            .active(saved.bar)
+            .build();
+        let auto = adw::SwitchRow::builder()
+            .title("Update automatically when the wallpaper changes")
+            .subtitle("Picking a wallpaper here also applies its colours")
+            .active(saved.auto)
+            .build();
+        group.add(&windows);
+        group.add(&bar);
+        group.add(&auto);
+
+        let m = Rc::new(Self {
+            ctx: ctx.clone(),
+            group,
+            strip,
+            windows,
+            bar,
+            auto,
+            button,
+            shown: RefCell::default(),
+            palette: RefCell::default(),
+        });
+        for row in [&m.windows, &m.bar, &m.auto] {
+            let w = Rc::downgrade(&m);
+            row.connect_active_notify(move |_| {
+                if let Some(m) = w.upgrade() {
+                    m.save();
+                }
+            });
+        }
+        let w = Rc::downgrade(&m);
+        m.button.connect_clicked(move |b| {
+            if let Some(m) = w.upgrade() {
+                m.apply(b.upcast_ref());
+            }
+        });
+        m.fill(None);
+        m.refresh();
+        m
+    }
+
+    fn settings(&self) -> MatchSettings {
+        MatchSettings {
+            windows: self.windows.is_active(),
+            bar: self.bar.is_active(),
+            auto: self.auto.is_active(),
+        }
+    }
+
+    fn save(&self) {
+        let s = self.settings();
+        if let Err(e) = s.save(&self.ctx.data_dir) {
+            self.ctx.toast(&format!("{:#}", e));
+        }
+        self.update_button();
+    }
+
+    /// The button needs a palette and something to colour.
+    fn update_button(&self) {
+        let s = self.settings();
+        self.button
+            .set_sensitive(self.palette.borrow().is_some() && (s.windows || s.bar));
+    }
+
+    fn fill(&self, palette: Option<&Palette>) {
+        while let Some(c) = self.strip.first_child() {
+            self.strip.remove(&c);
+        }
+        let roles = palette.map(|p| p.roles());
+        for (i, name) in ["Background", "Surface", "Text", "Accent", "Secondary", "Urgent", "Muted"]
+            .iter()
+            .enumerate()
+        {
+            self.strip
+                .append(&swatch(name, roles.as_ref().map(|r| r[i].1)));
+        }
+    }
+
+    /// Read the palette of the current wallpaper if it changed.
+    fn refresh(self: &Rc<Self>) {
+        let home = dirs::home_dir().unwrap_or_default();
+        let now = current_wallpaper(&self.ctx.mgr.borrow(), &home);
+        if *self.shown.borrow() == now {
+            return;
+        }
+        self.shown.replace(now.clone());
+        self.palette.replace(None);
+        self.button.set_sensitive(false);
+        let Some(path) = now else {
+            self.fill(None);
+            self.group.set_description(Some("No wallpaper found"));
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.group.set_description(Some(&format!("Reading {}…", name)));
+        let w = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let p = path.clone();
+            let res = gio::spawn_blocking(move || palette_from_file(&p)).await;
+            let Some(m) = w.upgrade() else { return };
+            if m.shown.borrow().as_ref() != Some(&path) {
+                return; // the wallpaper changed again meanwhile
+            }
+            match res {
+                Ok(Ok(palette)) => {
+                    m.fill(Some(&palette));
+                    let note = if palette.neutral {
+                        " (no strong colour in it: a neutral palette)"
+                    } else {
+                        ""
+                    };
+                    m.group
+                        .set_description(Some(&format!("Colours from {}{}", name, note)));
+                    m.palette.replace(Some(palette));
+                    m.update_button();
+                }
+                Ok(Err(e)) => {
+                    m.fill(None);
+                    m.group.set_description(Some(&format!("{:#}", e)));
+                }
+                Err(_) => m.fill(None),
+            }
+        });
+    }
+
+    fn apply(self: &Rc<Self>, parent: &gtk::Widget) {
+        let Some(palette) = self.palette.borrow().clone() else {
+            return;
+        };
+        let s = self.settings();
+        if s.bar {
+            bar_colors(&self.ctx, &palette);
+        }
+        if !s.windows {
+            return;
+        }
+        let (ctx, par) = (self.ctx.clone(), parent.clone());
+        let go = move || {
+            let res = stage_window_colors(&mut ctx.mgr.borrow_mut(), &palette)
+                .and_then(|_| ctx.mgr.borrow_mut().apply());
+            match res {
+                Ok(r) => report_apply(&ctx, &par, &r, Some("Window colours applied")),
+                Err(e) => ctx.toast(&format!("Window colours: {:#}", e)),
+            }
+            ctx.changed();
+        };
+        if !self.ctx.mgr.borrow().is_dirty() {
+            go();
+            return;
+        }
+        let dialog = adw::AlertDialog::builder()
+            .heading("Apply Window Colours?")
+            .body("Your other staged changes are applied too, and MangoWM is reloaded.")
+            .default_response("apply")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("apply", "Apply");
+        dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+        dialog.connect_response(Some("apply"), move |_, _| go());
+        dialog.present(Some(parent));
+    }
+}
+
 pub fn page(ctx: &Ctx) -> gtk::Widget {
     let home = dirs::home_dir().unwrap_or_default();
     let entries = {
@@ -214,9 +526,13 @@ pub fn page(ctx: &Ctx) -> gtk::Widget {
         flow.append(&c.widget);
     }
 
-    // keep the "In Mango" mark right after a preset or a pick
+    let matcher = Matcher::new(ctx);
+
+    // keep the "In Mango" mark and the palette right after a preset or a pick
     let c = ctx.clone();
+    let m = matcher.clone();
     ctx.on_change(move || {
+        m.refresh();
         let now = mango_wallpaper(&c.mgr.borrow())
             .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
         for card in &cards {
@@ -240,6 +556,7 @@ pub fn page(ctx: &Ctx) -> gtk::Widget {
             .css_classes(["dim-label"])
             .build(),
     );
+    col.prepend(&matcher.group);
     col.append(&flow);
     let clamp = adw::Clamp::builder()
         .maximum_size(980)

@@ -223,7 +223,7 @@ The bar is stopped using a PID file; `pkill -f` matching only the bar the tool s
 
 ## Presets
 
-`clean` (calm blue), `tokyo-night` (deep navy, blue and cyan), `nord` (arctic blues), `gruvbox` (warm amber and orange), `glass` (translucent, deep blur), `zen` (no borders, no gaps, no blur), `everforest` (soft greens), `rose-pine` (muted rose and gold), `kanagawa` (ink blue), `solarized` (deep-sea teal), `latte` (light), `graphite` (monochrome).
+`clean` (calm blue), `tokyo-night` (deep navy, blue and cyan), `nord` (arctic blues), `gruvbox` (warm amber and orange), `glass` (translucent, deep blur, icy blue), `zen` (no borders, no gaps, no blur), `everforest` (soft greens), `rose-pine` (muted rose and gold), `kanagawa` (ink blue), `solarized` (deep-sea teal), `latte` (light), `graphite` (monochrome).
 
 Every preset is a tiling setup: Mango's `tile` layout on every tag (`tag_rule=id:*,layout_name:tile`, after your own tag rules so it wins) and new windows join the stack (`new_is_master=0`). Each one also sets its own wallpaper: an original, procedurally drawn PNG (`data/wallpapers`, made by `render.py` there) that `install.sh` copies to `~/.local/share/mangowm-mod/wallpapers`. Applying a preset writes `exec_once=swaybg -m fill -i <wallpaper>` to `mango-mod.conf` (replacing any earlier managed swaybg line) and, when Mango confirms the reload, swaps the running swaybg right away. If your `config.conf` starts its own swaybg, remove that line, or at login either wallpaper may end up on top (the tool warns about it).
 

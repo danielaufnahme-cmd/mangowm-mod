@@ -211,14 +211,14 @@ SPECS = {
         "layers": hills(["#6b5440", "#4a3d33", "#32302f", "#1d2021"], 0.60, 0.08, 4.2),
         "vignette": 0.2,
     },
-    # glass: soft, defocused light blobs in teal, blue and peach
+    # glass: soft, defocused frosted light blobs in icy blue and frost white
     "glass": {
-        "sky": [(0.0, "#14161f"), (1.0, "#1c1f2b")],
+        "sky": [(0.0, "#10161c"), (1.0, "#172029")],
         "glows": [
-            (0.25, 0.30, 0.38, "#5fb3c4", 0.45),
-            (0.70, 0.62, 0.45, "#5b7fd6", 0.40),
-            (0.55, 0.15, 0.25, "#f2b28c", 0.30),
-            (0.15, 0.85, 0.28, "#3d8f8a", 0.30),
+            (0.25, 0.30, 0.38, "#7cc4e4", 0.42),
+            (0.70, 0.62, 0.45, "#4a8fb5", 0.38),
+            (0.55, 0.15, 0.25, "#dcf0f8", 0.22),
+            (0.15, 0.85, 0.28, "#3a7d96", 0.30),
         ],
         "vignette": 0.2,
     },

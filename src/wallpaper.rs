@@ -210,6 +210,13 @@ pub fn plasma_wallpaper_in(home: &Path) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// The wallpaper to match colours to: Mango's, else Plasma's.
+pub fn current_wallpaper(mgr: &ConfigManager, home: &Path) -> Option<PathBuf> {
+    mango_wallpaper(mgr)
+        .filter(|p| p.is_file())
+        .or_else(|| plasma_wallpaper_in(home))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WallpaperEntry {
     pub path: PathBuf,

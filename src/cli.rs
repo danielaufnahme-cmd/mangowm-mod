@@ -16,7 +16,10 @@ use crate::core::items::{Bind, Monitor, Rule};
 use crate::core::manager::{detect_data_dir, ApplyResult, ConfigManager};
 use crate::core::schema::{get_schema_pages, search_options, OptionItem};
 use crate::presets::{apply_preset, find_preset, list_presets};
-use crate::wallpaper::set_wallpaper;
+use crate::palette::{
+    apply_bar_colors, palette_from_file, restart_bar_if_running, stage_window_colors, window_colors,
+};
+use crate::wallpaper::{current_wallpaper, set_wallpaper};
 
 /// Rule kinds `rule add` accepts (monitor rules go through `monitor`).
 pub const RULE_ADD_KINDS: &[&str] = &[
@@ -118,6 +121,12 @@ pub enum Commands {
         action: WallpaperCommands,
     },
 
+    #[command(about = "Colours matched to the wallpaper")]
+    Colors {
+        #[command(subcommand)]
+        action: ColorsCommands,
+    },
+
     #[command(about = "Programs started by MangoWM (exec_once / exec)")]
     Autostart {
         #[command(subcommand)]
@@ -150,6 +159,25 @@ pub enum PresetCommands {
 pub enum WallpaperCommands {
     #[command(about = "Set the wallpaper to a picture file (applies at once)")]
     Set { path: PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ColorsCommands {
+    #[command(
+        about = "Match window borders and/or the bar to a picture (default: both, the current wallpaper)"
+    )]
+    FromWallpaper {
+        #[arg(long, help = "Window border colours (staged; written by `apply`)")]
+        windows: bool,
+        #[arg(long, help = "Bar colours (saved, files written, restarted if running)")]
+        bar: bool,
+        #[arg(long, help = "Also apply the staged window colours at once")]
+        apply: bool,
+        #[arg(long, help = "Only print the palette; change nothing")]
+        preview: bool,
+        #[arg(help = "Picture file (default: Mango's wallpaper, else Plasma's)")]
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -950,6 +978,56 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 println!("Wallpaper: {}", path.display().to_string().green().bold());
                 if !print_apply(&res) {
                     std::process::exit(1);
+                }
+            }
+        },
+
+        Commands::Colors { action } => match action {
+            ColorsCommands::FromWallpaper {
+                windows,
+                bar,
+                apply,
+                preview,
+                path,
+            } => {
+                let home = dirs::home_dir().unwrap_or_default();
+                let path = match path.or_else(|| current_wallpaper(&mgr, &home)) {
+                    Some(p) => p,
+                    None => bail!("no wallpaper is set; give a picture file"),
+                };
+                let palette = palette_from_file(&path)?;
+                println!("Palette of {}:", path.display().to_string().bold());
+                for (name, c) in palette.roles() {
+                    println!("  {:<10} {}", name, c.hex().truecolor(c.r, c.g, c.b));
+                }
+                if palette.neutral {
+                    println!("  (no strong colour in the picture: neutral palette)");
+                }
+                if preview {
+                    return Ok(());
+                }
+                let (windows, bar) = if windows || bar { (windows, bar) } else { (true, true) };
+                if bar {
+                    let cfg = apply_bar_colors(&palette, &mgr.data_dir, None)?;
+                    let dir = bar_dir(cfg.backend);
+                    println!("Bar colours saved; files written to {}", dir.display());
+                    if let Some(pid) = restart_bar_if_running(&cfg, Some(&dir), &mgr.data_dir)? {
+                        println!("Restarted {} (PID {})", cfg.backend.binary(), pid);
+                    }
+                }
+                if windows {
+                    stage_window_colors(&mut mgr, &palette)?;
+                    for (key, value) in window_colors(&palette) {
+                        let written = mgr.get(key).unwrap_or(value);
+                        println!("Staged: {}={}", key.yellow(), written.green());
+                    }
+                    if apply {
+                        if !print_apply(&mgr.apply()?) {
+                            std::process::exit(1);
+                        }
+                    } else {
+                        staged_hint();
+                    }
                 }
             }
         },

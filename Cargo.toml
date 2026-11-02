@@ -31,6 +31,8 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 colored = "2.1"
 anyhow = "1.0"
+# Wallpaper palette extraction (src/palette.rs).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 # GTK4 / libadwaita settings window (`--features gui`); never part of the CLI build.
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"], optional = true }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_6"], optional = true }

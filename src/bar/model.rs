@@ -17,6 +17,7 @@ use crate::core::values::parse_color;
 pub const BAR_FIELDS: &[&str] = &[
     "backend",
     "height",
+    "auto-height",
     "layer",
     "position",
     "output",
@@ -42,12 +43,30 @@ pub const BAR_FIELDS: &[&str] = &[
     "module-margin",
     "module-gap",
     "module-radius",
+    "title-length",
+    "tag-fill",
     "left",
     "center",
     "right",
     "waybar-mango-modules",
     "start-at-login",
 ];
+
+/// Space between the text line and a module's top/bottom edge.
+pub const TEXT_INSET: u32 = 4;
+
+/// Text line height (ascent + descent) of a `size` px font, rounded up.
+/// fcft and Pango give 1.38-1.46 x the size for the usual UI and Nerd fonts
+/// (JetBrainsMono Nerd Font 13: 14 + 5 = 19 px, measured with fcft); 1.5 x
+/// covers them.
+pub fn line_height(font_size: u32) -> u32 {
+    (font_size * 3).div_ceil(2)
+}
+
+/// Average glyph advance, for the window title cap (JetBrainsMono: 0.6 em).
+pub fn char_width(font_size: u32) -> u32 {
+    (font_size * 62).div_ceil(100)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -179,10 +198,10 @@ fn default_center() -> Vec<String> {
     vec!["clock".into()]
 }
 fn default_right() -> Vec<String> {
-    ["tray", "cpu", "memory", "network", "pulseaudio"]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    ["cpu", "memory", "pulseaudio", "network", "battery", "tray"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 impl Default for BarModules {
@@ -274,8 +293,13 @@ impl BarModules {
 pub struct BarConfig {
     #[serde(default)]
     pub backend: Backend,
+    /// Manual height; only used when `auto_height` is off, and never below
+    /// [`BarConfig::min_height`].
     #[serde(default = "default_height")]
     pub height: u32,
+    /// Height follows the font and module spacing ([`BarConfig::min_height`]).
+    #[serde(default = "default_true")]
+    pub auto_height: bool,
     #[serde(default)]
     pub modules: BarModules,
     /// Colors are stored as #rrggbbaa.
@@ -341,6 +365,13 @@ pub struct BarConfig {
     pub border_width: u32,
     #[serde(default = "default_border_color")]
     pub border_color: String,
+    /// Window title cap in characters (Mangobar gets it in pixels); 0 = none.
+    #[serde(default = "default_title_length")]
+    pub title_length: u32,
+    /// Active tag filled with the accent; off = accent text (Waybar adds an
+    /// underline).
+    #[serde(default = "default_true")]
+    pub tag_fill: bool,
     /// Start this bar when Mango starts (exec_once in mango-mod.conf).
     #[serde(default = "default_true")]
     pub start_at_login: bool,
@@ -361,15 +392,16 @@ pub struct BarConfig {
 /// Kept for compatibility with mangowm-mod 1.0.
 pub type Mangobar = BarConfig;
 
-// Defaults follow the floating teal Waybar of ~/.config/waybar (2026-10).
+// Defaults are the "Islands" bar preset (src/bar/presets.rs; a test keeps
+// them in step).
 fn default_height() -> u32 {
-    34
+    28
 }
 fn default_bg() -> String {
-    "#131316b8".to_string()
+    "#00000000".to_string()
 }
 fn default_fg() -> String {
-    "#e5e1e5ff".to_string()
+    "#e6e8ebff".to_string()
 }
 fn default_accent() -> String {
     "#76ccb1ff".to_string()
@@ -381,49 +413,52 @@ fn default_font() -> String {
     "Adwaita Sans, JetBrainsMono Nerd Font".to_string()
 }
 fn default_font_weight() -> String {
-    "normal".to_string()
+    "medium".to_string()
 }
 fn default_position() -> String {
     "top".to_string()
 }
 fn default_margin_top() -> u32 {
-    8
-}
-fn default_margin_side() -> u32 {
-    12
-}
-fn default_spacing() -> u32 {
     6
 }
+fn default_margin_side() -> u32 {
+    8
+}
+fn default_spacing() -> u32 {
+    0
+}
 fn default_module_bg() -> String {
-    "#ffffff0f".to_string()
+    "#16181ce6".to_string()
 }
 fn default_hover() -> String {
-    "#ffffff1a".to_string()
+    "#2a2e35ff".to_string()
 }
 fn default_urgent() -> String {
-    "#e06c75ff".to_string()
+    "#e5737aff".to_string()
 }
 fn default_inactive() -> String {
-    "#9a98a0ff".to_string()
+    "#7c828cff".to_string()
 }
 fn default_module_padding() -> u32 {
-    10
+    12
 }
 fn default_module_margin() -> u32 {
-    5
+    0
 }
 fn default_module_gap() -> u32 {
-    2
+    3
 }
 fn default_module_radius() -> i32 {
-    9
+    10
 }
 fn default_border_width() -> u32 {
-    1
+    0
 }
 fn default_border_color() -> String {
-    "#ffffff0f".to_string()
+    "#ffffff14".to_string()
+}
+fn default_title_length() -> u32 {
+    48
 }
 fn default_font_size() -> u32 {
     13
@@ -440,6 +475,7 @@ impl Default for BarConfig {
         Self {
             backend: Backend::default(),
             height: default_height(),
+            auto_height: true,
             modules: BarModules::default(),
             bg_color: default_bg(),
             fg_color: default_fg(),
@@ -466,6 +502,8 @@ impl Default for BarConfig {
             module_radius: default_module_radius(),
             border_width: default_border_width(),
             border_color: default_border_color(),
+            title_length: default_title_length(),
+            tag_fill: true,
             start_at_login: true,
             waybar_mango_modules: false,
             options: BTreeMap::new(),
@@ -519,9 +557,57 @@ impl BarConfig {
         atomic_write(path, &(serde_json::to_string_pretty(self)? + "\n"))
     }
 
+    /// Height a module needs: the text line plus [`TEXT_INSET`] above and below.
+    pub fn module_min_height(&self) -> u32 {
+        line_height(self.font_size) + 2 * TEXT_INSET
+    }
+
+    /// Smallest bar height that fits the modules. Mangobar draws every module
+    /// at the bar's full height and has no vertical module margin (mangobar
+    /// `paint_module`); in Waybar the module margins and the border sit
+    /// inside the bar's height.
+    pub fn min_height(&self) -> u32 {
+        match self.backend {
+            Backend::Mangobar => self.module_min_height(),
+            Backend::Waybar => {
+                self.module_min_height() + 2 * self.module_margin + 2 * self.border_width
+            }
+        }
+    }
+
+    /// Height written to the config: automatic, or the manual height raised
+    /// to [`Self::min_height`].
+    pub fn effective_height(&self) -> u32 {
+        if self.auto_height {
+            self.min_height()
+        } else {
+            self.height.max(self.min_height())
+        }
+    }
+
+    /// Height of a module in the running bar.
+    pub fn module_height(&self) -> u32 {
+        let h = self.effective_height();
+        match self.backend {
+            Backend::Mangobar => h,
+            Backend::Waybar => h - 2 * self.module_margin - 2 * self.border_width,
+        }
+    }
+
+    /// The window title cap in pixels (Mangobar's `max-length` unit).
+    pub fn title_max_px(&self) -> u32 {
+        self.title_length * char_width(self.font_size)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.height == 0 || self.height > 500 {
             bail!("bar height must be 1-500");
+        }
+        if self.font_size == 0 || self.font_size > 200 {
+            bail!("font size must be 1-200");
+        }
+        if self.title_length > 500 {
+            bail!("title length must be 0-500 characters");
         }
         if !LAYERS.contains(&self.layer.as_str()) {
             bail!("layer must be one of {}", LAYERS.join(", "));
@@ -592,7 +678,20 @@ impl BarConfig {
             }
         };
         match key {
-            "height" => self.height = num("height")?,
+            "height" => {
+                // a height typed in means a manual height
+                self.height = num("height")?;
+                self.auto_height = false;
+            }
+            "auto-height" => {
+                self.auto_height = crate::core::values::parse_bool(value)
+                    .context("auto-height must be true or false")?
+            }
+            "title-length" => self.title_length = num("title length")?,
+            "tag-fill" => {
+                self.tag_fill = crate::core::values::parse_bool(value)
+                    .context("tag-fill must be true or false")?
+            }
             "radius" => self.radius = radius()?,
             "bg" | "bg_color" | "background" => self.bg_color = normalize_color(value)?,
             "fg" | "fg_color" | "foreground" => self.fg_color = normalize_color(value)?,

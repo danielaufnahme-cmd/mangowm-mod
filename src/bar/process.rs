@@ -184,6 +184,17 @@ fn stop_by_command_line(bar: &BarConfig, dir: Option<&Path>) -> Result<Option<St
     if !have_proc() {
         return pkill_ours(&targets);
     }
+    let mut msgs = Vec::new();
+    for (pid, binary) in find_ours(&targets)? {
+        if let Some(msg) = stop_pid(pid, binary)? {
+            msgs.push(msg);
+        }
+    }
+    Ok((!msgs.is_empty()).then(|| msgs.join("; ")))
+}
+
+/// Running `<binary> -c <cfg>` processes for the targets, from /proc.
+fn find_ours(targets: &[(Backend, PathBuf)]) -> Result<Vec<(u32, &'static str)>> {
     let me = std::process::id();
     let mut found: Vec<(u32, &'static str)> = Vec::new();
     for entry in fs::read_dir("/proc")?.flatten() {
@@ -201,20 +212,29 @@ fn stop_by_command_line(bar: &BarConfig, dir: Option<&Path>) -> Result<Option<St
             continue;
         };
         let argv: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-        for (backend, cfg) in &targets {
+        for (backend, cfg) in targets {
             let cfg = cfg.display().to_string();
             if argv_matches(&argv, backend.binary(), cfg.as_bytes()) {
                 found.push((pid, backend.binary()));
             }
         }
     }
-    let mut msgs = Vec::new();
-    for (pid, binary) in found {
-        if let Some(msg) = stop_pid(pid, binary)? {
-            msgs.push(msg);
+    Ok(found)
+}
+
+/// True when a bar MangoWM Mod started (PID file, or `-c <our config>`,
+/// e.g. from mango-mod.conf at login) is running. False without /proc.
+pub fn our_bar_running(data_dir: &Path) -> bool {
+    if !have_proc() {
+        return false;
+    }
+    if let Some((pid, binary)) = read_pid_file(&pid_file(data_dir)) {
+        if is_our_process(pid, &binary) {
+            return true;
         }
     }
-    Ok((!msgs.is_empty()).then(|| msgs.join("; ")))
+    let targets = our_configs(&BarConfig::default(), None);
+    find_ours(&targets).is_ok_and(|f| !f.is_empty())
 }
 
 /// `pkill -f "<binary> -c <our config>"` for systems without /proc.

@@ -127,8 +127,8 @@ pub fn list_presets() -> Vec<Preset> {
             &[
                 ("border_radius", "16"),
                 ("border_px", "1"),
-                ("focus_color", "#cba6f7"),
-                ("border_color", "#45475a"),
+                ("focus_color", "#9fd8ef"),
+                ("border_color", "#3d4b57"),
                 ("blur", "true"),
                 ("focused_opacity", "0.92"),
                 ("unfocused_opacity", "0.78"),

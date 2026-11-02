@@ -12,7 +12,9 @@ use mangowm_mod::bar::generate::{bar_dir, warnings, waybar_module_name, write_ba
 use mangowm_mod::bar::login::{
     disable_unmanaged_bars, login_state, set_login_start, unmanaged_bar_lines, LoginState,
 };
-use mangowm_mod::bar::model::{Backend, BarConfig, FONT_WEIGHTS, KNOWN_MODULES, LAYERS, POSITIONS};
+use mangowm_mod::bar::model::{
+    line_height, Backend, BarConfig, FONT_WEIGHTS, KNOWN_MODULES, LAYERS, POSITIONS, TEXT_INSET,
+};
 use mangowm_mod::bar::options::find_opt;
 use mangowm_mod::bar::process::{foreign_bars, start_bar, stop_bar, stop_foreign, ForeignBar};
 
@@ -22,6 +24,8 @@ use crate::rows::{color_button, from_gdk, to_gdk};
 
 #[path = "bar_modules.rs"]
 mod bar_modules;
+#[path = "bar_presets.rs"]
+mod bar_presets;
 
 type Getter = fn(&BarConfig) -> f64;
 type ColorGetter = fn(&BarConfig) -> &str;
@@ -37,6 +41,8 @@ pub(crate) struct BarPage {
     position: adw::ComboRow,
     output: adw::EntryRow,
     mango_modules: adw::SwitchRow,
+    auto_height: adw::SwitchRow,
+    tag_fill: adw::SwitchRow,
     spins: Vec<(&'static str, adw::SpinRow, Getter)>,
     font: adw::EntryRow,
     weight: adw::ComboRow,
@@ -49,6 +55,7 @@ pub(crate) struct BarPage {
     waybar_only: Vec<gtk::Widget>,
     migrate: adw::PreferencesGroup,
     migrate_row: adw::ActionRow,
+    presets: bar_presets::Presets,
     modules: bar_modules::Modules,
     extra: adw::PreferencesGroup,
     extra_rows: RefCell<Vec<gtk::Widget>>,
@@ -131,9 +138,36 @@ impl BarPage {
             self.output.set_text(&output);
         }
         self.mango_modules.set_active(bar.waybar_mango_modules);
-        for (_, row, get) in &self.spins {
+        for (key, row, get) in &self.spins {
             row.set_value(get(&bar));
+            match *key {
+                "height" => {
+                    row.set_sensitive(!bar.auto_height);
+                    row.set_subtitle(&format!(
+                        "At least {} px, so the text fits",
+                        bar.min_height()
+                    ));
+                }
+                "module-margin" if !waybar => {
+                    row.set_subtitle("Waybar only: Mangobar modules fill the bar's height")
+                }
+                "module-margin" => row.set_subtitle(""),
+                _ => {}
+            }
         }
+        self.auto_height.set_active(bar.auto_height);
+        self.auto_height.set_subtitle(&format!(
+            "auto: {} px (text line {} px + 2 × {} px{})",
+            bar.min_height(),
+            line_height(bar.font_size),
+            TEXT_INSET,
+            if waybar {
+                " + module margins and border"
+            } else {
+                ""
+            }
+        ));
+        self.tag_fill.set_active(bar.tag_fill);
         if self.font.text() != bar.font {
             self.font.set_text(&bar.font);
         }
@@ -164,6 +198,7 @@ impl BarPage {
         self.updating.set(false);
         self.files
             .set_subtitle(&bar_dir(bar.backend).display().to_string());
+        self.presets.update(&bar);
         self.load_login(&bar);
         self.load_modules(&bar);
         self.load_lists(&bar);
@@ -428,6 +463,8 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
     migrate.set_visible(false);
     page.add(&migrate);
 
+    let presets = bar_presets::Presets::new(&page);
+
     // general
     let backend = adw::ComboRow::builder()
         .title("Bar program")
@@ -475,9 +512,13 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         "Size and Spacing",
         "In pixels. Margins are the gap between the bar and the screen edges",
     );
+    let auto_height = adw::SwitchRow::builder()
+        .title("Automatic height")
+        .build();
+    size.add(&auto_height);
     let mut spins: Vec<(&'static str, adw::SpinRow, Getter)> = Vec::new();
-    let size_rows: [(&'static str, &str, f64, f64, Getter, bool); 9] = [
-        ("height", "Height", 1.0, 500.0, |b| b.height as f64, false),
+    let size_rows: [(&'static str, &str, f64, f64, Getter, bool); 10] = [
+        ("height", "Height", 1.0, 500.0, |b| b.effective_height() as f64, false),
         ("margin-top", "Top margin", 0.0, 200.0, |b| b.margin_top as f64, false),
         ("margin-bottom", "Bottom margin", 0.0, 200.0, |b| b.margin_bottom as f64, true),
         ("margin-left", "Left margin", 0.0, 500.0, |b| b.margin_left as f64, false),
@@ -486,6 +527,8 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         ("module-padding", "Module padding", 0.0, 100.0, |b| b.module_padding as f64, false),
         ("module-margin", "Module top/bottom margin", 0.0, 100.0, |b| b.module_margin as f64, false),
         ("module-gap", "Module side margin", 0.0, 100.0, |b| b.module_gap as f64, false),
+        ("title-length", "Window title max length (characters, 0 = no limit)", 0.0, 500.0,
+            |b| b.title_length as f64, false),
     ];
     for (key, title, lo, hi, get, wb) in size_rows {
         let row = spin(title, lo, hi);
@@ -552,6 +595,11 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
     look.add(&radius_pill);
     look.add(&module_radius);
     look.add(&module_pill);
+    let tag_fill = adw::SwitchRow::builder()
+        .title("Filled active tag")
+        .subtitle("Off: the active tag is accent text")
+        .build();
+    look.add(&tag_fill);
     page.add(&look);
 
     let modules = bar_modules::Modules::new(&page);
@@ -632,6 +680,8 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         position,
         output,
         mango_modules,
+        auto_height,
+        tag_fill,
         spins,
         font,
         weight,
@@ -643,6 +693,7 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         waybar_only,
         migrate,
         migrate_row,
+        presets,
         modules,
         extra,
         extra_rows: RefCell::new(Vec::new()),
@@ -738,6 +789,17 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         st,
         move |r| st.set("output", &r.text())
     ));
+    st.auto_height.connect_active_notify(clone!(
+        #[weak]
+        st,
+        move |r| st.set("auto-height", &r.is_active().to_string())
+    ));
+    st.tag_fill.connect_active_notify(clone!(
+        #[weak]
+        st,
+        move |r| st.set("tag-fill", &r.is_active().to_string())
+    ));
+    st.connect_presets();
     st.mango_modules.connect_active_notify(clone!(
         #[weak]
         st,

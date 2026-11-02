@@ -109,7 +109,12 @@ fn module_defaults(bar: &BarConfig, name: &str) -> Value {
             "workspaces" => {
                 json!({"hide-empty": true, "on-click": "activate", "on-click-right": "toggle"})
             }
-            "layout" | "window" => json!({"format": "{}"}),
+            "layout" => json!({"format": "{}"}),
+            // max-length is in pixels in Mangobar (mangobar `module_max_length`)
+            "window" if bar.title_length > 0 => {
+                json!({"format": "{}", "max-length": bar.title_max_px()})
+            }
+            "window" => json!({"format": "{}"}),
             "keyboardlayout" => json!({"format": "{short}"}),
             "hideclients" => json!({"format": " {}"}),
             // {load} is the load average, not a percentage
@@ -151,14 +156,20 @@ fn module_defaults(bar: &BarConfig, name: &str) -> Value {
                 "sort-by-id": true,
                 "ignore-hidden": true
             }),
-            "window" if !bar.waybar_mango_modules => json!({
-                "exec": WAYBAR_WINDOW_EXEC,
-                "restart-interval": 3,
-                "escape": true,
-                "max-length": 60,
-                "hide-empty-text": true,
-                "tooltip": false
-            }),
+            "window" if !bar.waybar_mango_modules => {
+                let mut o = json!({
+                    "exec": WAYBAR_WINDOW_EXEC,
+                    "restart-interval": 3,
+                    "escape": true,
+                    "hide-empty-text": true,
+                    "tooltip": false
+                });
+                if bar.title_length > 0 {
+                    o["max-length"] = json!(bar.title_length);
+                }
+                o
+            }
+            "window" if bar.title_length > 0 => json!({"max-length": bar.title_length}),
             "cpu" => json!({"format": "󰍛 {usage}%", "interval": 3, "tooltip": false}),
             "memory" => json!({
                 "format": "󰘚 {percentage}%",
@@ -248,7 +259,7 @@ pub fn generate_config(bar: &BarConfig) -> String {
     if bar.backend == Backend::Waybar {
         map.insert("position".into(), json!(bar.position));
     }
-    map.insert("height".into(), json!(bar.height));
+    map.insert("height".into(), json!(bar.effective_height()));
     if !bar.output.is_empty() {
         map.insert("output".into(), json!(bar.output));
     }
@@ -315,6 +326,54 @@ fn rgba(color: &str) -> (u8, u8, u8, u8) {
             .unwrap_or(255)
     };
     (byte(0), byte(2), byte(4), byte(6))
+}
+
+/// `top` drawn over `bottom` (both #rrggbbaa), as #rrggbbaa.
+pub fn blend_over(top: &str, bottom: &str) -> String {
+    let (tr, tg, tb, ta) = rgba(top);
+    let (br, bg, bb, ba) = rgba(bottom);
+    let (ta, ba) = (ta as f64 / 255.0, ba as f64 / 255.0);
+    let a = ta + ba * (1.0 - ta);
+    if a <= 0.0 {
+        return "#00000000".to_string();
+    }
+    let mix = |t: u8, b: u8| {
+        ((t as f64 * ta + b as f64 * ba * (1.0 - ta)) / a)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    format!(
+        "#{:02x}{:02x}{:02x}{:02x}",
+        mix(tr, br),
+        mix(tg, bg),
+        mix(tb, bb),
+        (a * 255.0).round() as u8
+    )
+}
+
+pub fn alpha(color: &str) -> u8 {
+    rgba(color).3
+}
+
+/// Opaque color for menus, tooltips and the text on the accent: the bar
+/// background, else the module background (a transparent bar), else a dark grey.
+pub fn surface_color(bar: &BarConfig) -> String {
+    let pick = [&bar.bg_color, &bar.module_bg_color]
+        .into_iter()
+        .find(|c| alpha(c) > 0)
+        .map(|c| c.as_str())
+        .unwrap_or("#16181cff");
+    let (r, g, b, _) = rgba(pick);
+    format!("#{:02x}{:02x}{:02x}ff", r, g, b)
+}
+
+/// Mangobar paints `#bar` only between the module groups, as a plain
+/// rectangle, and each module only under itself, at the bar's full height
+/// (mangobar `draw_bar`, `paint_module`). A bar with a visible background is
+/// made continuous: every module paints the bar background (with its chip
+/// color on top) and has no side margins, so the bar has square ends.
+pub fn mangobar_continuous(bar: &BarConfig) -> bool {
+    bar.backend == Backend::Mangobar && alpha(&bar.bg_color) > 0
 }
 
 /// Color in the backend's CSS syntax, with the alpha replaced when given.
@@ -411,17 +470,32 @@ fn css_id(backend: Backend, name: &str, mango_modules: bool) -> Option<String> {
 
 pub fn generate_style(bar: &BarConfig) -> String {
     let be = bar.backend;
+    let continuous = mangobar_continuous(bar);
+    // Mangobar's continuous bar: the colors modules paint over nothing
+    let on_bar = |c: &str| {
+        if continuous {
+            blend_over(c, &bar.bg_color)
+        } else {
+            c.to_string()
+        }
+    };
     let bg = css_color(be, &bar.bg_color, None);
     let fg = css_color(be, &bar.fg_color, None);
-    let accent = css_color(be, &bar.accent_color, None);
-    let solid_bg = css_color(be, &bar.bg_color, Some(0xff));
-    let chip = css_color(be, &bar.module_bg_color, None);
-    let hover = css_color(be, &bar.hover_color, None);
-    let urgent = css_color(be, &bar.urgent_color, None);
+    let accent = css_color(be, &on_bar(&bar.accent_color), None);
+    let surface = css_color(be, &surface_color(bar), None);
+    let chip = css_color(be, &on_bar(&bar.module_bg_color), None);
+    let hover = css_color(be, &on_bar(&bar.hover_color), None);
+    let urgent = css_color(be, &on_bar(&bar.urgent_color), None);
     let inactive = css_color(be, &bar.inactive_color, None);
     let radius = css_radius(be, bar.radius);
-    let mr = css_radius(be, bar.module_radius);
-    let (pad, vm, gap) = (bar.module_padding, bar.module_margin, bar.module_gap);
+    let (mut pad, vm, mut gap) = (bar.module_padding, bar.module_margin, bar.module_gap);
+    let mut mr = css_radius(be, bar.module_radius);
+    if continuous {
+        // margins would be holes in the bar: the gap becomes padding
+        pad += gap;
+        gap = 0;
+        mr = "0px".to_string();
+    }
 
     let mut ids: Vec<String> = Vec::new();
     let mut workspaces = false;
@@ -458,27 +532,33 @@ pub fn generate_style(bar: &BarConfig) -> String {
                 bar.margin_top, bar.margin_left, bar.margin_right
             ));
             if workspaces {
+                // tags carry the module color, so the tag row matches the modules
+                let (active_bg, active_fg) = if bar.tag_fill {
+                    (accent.clone(), surface.clone())
+                } else {
+                    (chip.clone(), accent.clone())
+                };
                 out.push_str(&format!(
-                    "#tags {{\n    padding: 0px {pad}px;\n    margin: {vm}px {gap}px;\n    color: {inactive};\n    \
-                     background: none;\n    border-radius: {mr};\n}}\n\n\
+                    "#tags {{\n    padding: 0px {pad}px;\n    margin: 0px {gap}px;\n    color: {inactive};\n    \
+                     background-color: {chip};\n    border-radius: {mr};\n}}\n\n\
                      #tags:hover {{\n    background-color: {hover};\n    color: {fg};\n}}\n\n\
-                     #tags.active {{\n    background-color: {accent};\n    color: {solid_bg};\n}}\n\n\
+                     #tags.active {{\n    background-color: {active_bg};\n    color: {active_fg};\n}}\n\n\
                      #tags.occupied {{\n    color: {fg};\n}}\n\n\
-                     #tags.urgent {{\n    background-color: {urgent};\n    color: {solid_bg};\n}}\n\n\
+                     #tags.urgent {{\n    background-color: {urgent};\n    color: {surface};\n}}\n\n\
                      #tags.empty,\n#tags.inactive {{\n    color: {inactive};\n}}\n\n\
-                     #overview {{\n    background-color: {accent};\n    color: {solid_bg};\n}}\n\n"
+                     #overview {{\n    background-color: {accent};\n    color: {surface};\n}}\n\n"
                 ));
             }
             if !ids.is_empty() {
                 out.push_str(&format!(
-                    "{} {{\n    padding: 0px {pad}px;\n    margin: {vm}px {gap}px;\n    color: {fg};\n    \
+                    "{} {{\n    padding: 0px {pad}px;\n    margin: 0px {gap}px;\n    color: {fg};\n    \
                      background-color: {chip};\n    border-radius: {mr};\n}}\n\n",
                     ids.join(",\n")
                 ));
             }
             // tray menus (border-color is only read for menus)
             out.push_str(&format!(
-                "menu {{\n    background-color: {solid_bg};\n    color: {fg};\n    border-color: {chip};\n}}\n\n\
+                "menu {{\n    background-color: {surface};\n    color: {fg};\n    border-color: {hover};\n}}\n\n\
                  menuitem:hover {{\n    background-color: {hover};\n}}\n"
             ));
         }
@@ -498,17 +578,22 @@ pub fn generate_style(bar: &BarConfig) -> String {
             };
             out.push_str(&format!(
                 "window#waybar {{\n    background-color: {bg};\n    color: {fg};\n    border-radius: {radius};{border}\n}}\n\n\
-                 tooltip {{\n    background-color: {solid_bg};\n    border-radius: 10px;\n}}\n\n\
+                 tooltip {{\n    background-color: {surface};\n    border-radius: 10px;\n}}\n\n\
                  tooltip label {{\n    color: {fg};\n}}\n\n"
             ));
             if workspaces {
+                let active = if bar.tag_fill {
+                    format!("background-color: {accent};\n    color: {surface};")
+                } else {
+                    format!("color: {accent};\n    box-shadow: inset 0 -2px {accent};")
+                };
                 out.push_str(&format!(
                     "#workspaces button {{\n    padding: 0 {pad}px;\n    margin: {vm}px {gap}px;\n    color: {inactive};\n    \
-                     background: transparent;\n    border-radius: {mr};\n    \
+                     background-color: {chip};\n    border-radius: {mr};\n    box-shadow: none;\n    \
                      transition: background-color 150ms ease, color 150ms ease;\n}}\n\n\
                      #workspaces button:hover {{\n    background: {hover};\n    color: {fg};\n    box-shadow: none;\n}}\n\n\
-                     #workspaces button.active {{\n    background-color: {accent};\n    color: {solid_bg};\n}}\n\n\
-                     #workspaces button.urgent {{\n    background-color: {urgent};\n    color: {solid_bg};\n}}\n\n\
+                     #workspaces button.active {{\n    {active}\n}}\n\n\
+                     #workspaces button.urgent {{\n    background-color: {urgent};\n    color: {surface};\n}}\n\n\
                      #workspaces button.empty {{\n    color: {inactive};\n}}\n\n"
                 ));
             }
