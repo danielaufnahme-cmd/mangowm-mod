@@ -195,7 +195,10 @@ pub fn click_command(data_dir: Option<&Path>, id: &str, click: Click) -> String 
         click.name()
     );
     if let Some(d) = data_dir.filter(|d| *d != detect_data_dir(None)) {
-        cmd.push_str(&format!(" --data-dir {}", shell_quote(&d.display().to_string())));
+        cmd.push_str(&format!(
+            " --data-dir {}",
+            shell_quote(&d.display().to_string())
+        ));
     }
     cmd
 }

@@ -39,8 +39,7 @@ pub fn mangobar_dir() -> PathBuf {
 /// Window title for Waybar without the mango/* modules: a custom module
 /// that follows Mango's focused client over IPC (as ~/.config/waybar did).
 pub const WAYBAR_WINDOW_MODULE: &str = "custom/mango-window";
-const WAYBAR_WINDOW_EXEC: &str =
-    "mmsg watch focusing-client | jq --unbuffered -r '.title // \"\"'";
+const WAYBAR_WINDOW_EXEC: &str = "mmsg watch focusing-client | jq --unbuffered -r '.title // \"\"'";
 
 /// Waybar name of a module, or `None` when this Waybar setup cannot show it.
 pub fn waybar_module_name(name: &str, mango_modules: bool) -> Option<String> {

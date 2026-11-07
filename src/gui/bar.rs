@@ -14,7 +14,8 @@ use mangowm_mod::bar::login::{
     disable_unmanaged_bars, login_state, set_login_start, unmanaged_bar_lines, LoginState,
 };
 use mangowm_mod::bar::model::{
-    line_height, Backend, BarConfig, BAR_FIELDS, FONT_SIZE_RANGE, FONT_WEIGHTS, KNOWN_MODULES, LAYERS, POSITIONS, TEXT_INSET,
+    line_height, Backend, BarConfig, BAR_FIELDS, FONT_SIZE_RANGE, FONT_WEIGHTS, KNOWN_MODULES,
+    LAYERS, POSITIONS, TEXT_INSET,
 };
 use mangowm_mod::bar::options::find_opt;
 use mangowm_mod::bar::process::{
@@ -208,8 +209,7 @@ impl BarPage {
         let st = self.clone();
         glib::spawn_future_local(async move {
             // a Mangobar restart waits for the new bar: off the UI thread
-            let res =
-                gtk::gio::spawn_blocking(move || update_live(&bar, &data_dir, restart)).await;
+            let res = gtk::gio::spawn_blocking(move || update_live(&bar, &data_dir, restart)).await;
             st.live_busy.set(false);
             match res {
                 Ok(Ok(_)) => {}
@@ -436,9 +436,7 @@ impl BarPage {
 
     /// Stage the login line to match the switch; returns a note for the toast.
     fn sync_login(&self, bar: &BarConfig) -> Option<&'static str> {
-        let changed = self
-            .ctx
-            .stage(|m| set_login_start(m, bar.start_at_login))?;
+        let changed = self.ctx.stage(|m| set_login_start(m, bar.start_at_login))?;
         changed.then_some(if bar.start_at_login {
             "; start at login staged: press Apply"
         } else {
@@ -558,7 +556,6 @@ impl BarPage {
     }
 }
 
-
 fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -660,23 +657,90 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         "Size and Spacing",
         "In pixels. Margins are the gap between the bar and the screen edges",
     );
-    let auto_height = adw::SwitchRow::builder()
-        .title("Automatic height")
-        .build();
+    let auto_height = adw::SwitchRow::builder().title("Automatic height").build();
     size.add(&auto_height);
     let mut spins: Vec<(&'static str, adw::SpinRow, Getter)> = Vec::new();
     let size_rows: [(&'static str, &str, f64, f64, Getter, bool); 10] = [
-        ("height", "Height", 16.0, 160.0, |b| b.effective_height() as f64, false),
-        ("margin-top", "Top margin", 0.0, 100.0, |b| b.margin_top as f64, false),
-        ("margin-bottom", "Bottom margin", 0.0, 100.0, |b| b.margin_bottom as f64, true),
-        ("margin-left", "Left margin", 0.0, 1000.0, |b| b.margin_left as f64, false),
-        ("margin-right", "Right margin", 0.0, 1000.0, |b| b.margin_right as f64, false),
-        ("spacing", "Space between modules", 0.0, 50.0, |b| b.spacing as f64, true),
-        ("module-padding", "Module padding", 0.0, 60.0, |b| b.module_padding as f64, false),
-        ("module-margin", "Module top/bottom margin", 0.0, 30.0, |b| b.module_margin as f64, false),
-        ("module-gap", "Module side margin", 0.0, 40.0, |b| b.module_gap as f64, false),
-        ("title-length", "Window title max length (characters, 0 = no limit)", 0.0, 300.0,
-            |b| b.title_length as f64, false),
+        (
+            "height",
+            "Height",
+            16.0,
+            160.0,
+            |b| b.effective_height() as f64,
+            false,
+        ),
+        (
+            "margin-top",
+            "Top margin",
+            0.0,
+            100.0,
+            |b| b.margin_top as f64,
+            false,
+        ),
+        (
+            "margin-bottom",
+            "Bottom margin",
+            0.0,
+            100.0,
+            |b| b.margin_bottom as f64,
+            true,
+        ),
+        (
+            "margin-left",
+            "Left margin",
+            0.0,
+            1000.0,
+            |b| b.margin_left as f64,
+            false,
+        ),
+        (
+            "margin-right",
+            "Right margin",
+            0.0,
+            1000.0,
+            |b| b.margin_right as f64,
+            false,
+        ),
+        (
+            "spacing",
+            "Space between modules",
+            0.0,
+            50.0,
+            |b| b.spacing as f64,
+            true,
+        ),
+        (
+            "module-padding",
+            "Module padding",
+            0.0,
+            60.0,
+            |b| b.module_padding as f64,
+            false,
+        ),
+        (
+            "module-margin",
+            "Module top/bottom margin",
+            0.0,
+            30.0,
+            |b| b.module_margin as f64,
+            false,
+        ),
+        (
+            "module-gap",
+            "Module side margin",
+            0.0,
+            40.0,
+            |b| b.module_gap as f64,
+            false,
+        ),
+        (
+            "title-length",
+            "Window title max length (characters, 0 = no limit)",
+            0.0,
+            300.0,
+            |b| b.title_length as f64,
+            false,
+        ),
     ];
     for (key, title, lo, hi, get, wb) in size_rows {
         let row = spin(title, lo, hi);
@@ -700,7 +764,9 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
     );
     let weight = adw::ComboRow::builder()
         .title("Font weight")
-        .model(&gtk::StringList::new(&["Normal", "Medium", "Semibold", "Bold"]))
+        .model(&gtk::StringList::new(&[
+            "Normal", "Medium", "Semibold", "Bold",
+        ]))
         .build();
     let fonts = titled_group("Font", "");
     fonts.add(&font);
@@ -716,10 +782,28 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
         ("bg", "Background", "", |b| &b.bg_color, false),
         ("fg", "Text", "", |b| &b.fg_color, false),
         ("accent", "Accent", "Active tag", |b| &b.accent_color, false),
-        ("module-bg", "Module background", "", |b| &b.module_bg_color, false),
-        ("hover", "Hover", "Mangobar: tags only", |b| &b.hover_color, false),
+        (
+            "module-bg",
+            "Module background",
+            "",
+            |b| &b.module_bg_color,
+            false,
+        ),
+        (
+            "hover",
+            "Hover",
+            "Mangobar: tags only",
+            |b| &b.hover_color,
+            false,
+        ),
         ("urgent", "Urgent", "Urgent tag", |b| &b.urgent_color, false),
-        ("inactive", "Inactive", "Empty and inactive tags", |b| &b.inactive_color, false),
+        (
+            "inactive",
+            "Inactive",
+            "Empty and inactive tags",
+            |b| &b.inactive_color,
+            false,
+        ),
         ("border-color", "Border", "", |b| &b.border_color, true),
     ];
     for (key, title, sub, get, wb) in color_rows {
@@ -896,7 +980,10 @@ pub fn page(ctx: &Ctx) -> adw::PreferencesPage {
     st.position.connect_selected_notify(clone!(
         #[weak]
         st,
-        move |r| st.set("position", POSITIONS[r.selected() as usize % POSITIONS.len()])
+        move |r| st.set(
+            "position",
+            POSITIONS[r.selected() as usize % POSITIONS.len()]
+        )
     ));
     st.weight.connect_selected_notify(clone!(
         #[weak]

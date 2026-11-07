@@ -63,9 +63,7 @@ pub fn login_command(data_dir: &Path) -> String {
 pub fn is_login_command(cmd: &str) -> bool {
     let mut words = cmd.split_whitespace();
     let first = words.next().unwrap_or("").trim_matches('\'');
-    Path::new(first)
-        .file_name()
-        .is_some_and(|n| n == CLI_NAME)
+    Path::new(first).file_name().is_some_and(|n| n == CLI_NAME)
         && words.next() == Some("bar")
         && words.next() == Some("start")
 }

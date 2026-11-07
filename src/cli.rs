@@ -7,21 +7,21 @@ use std::path::{Path, PathBuf};
 
 use crate::bar::buttons::{import_picture, run_click, BarButton, Click, ClickAction, Tools};
 use crate::bar::generate::{bar_dir, warnings, waybar_module_name, write_bar_files};
-use crate::bar::model::{Backend, BarConfig, KNOWN_MODULES};
 use crate::bar::login::{
     disable_unmanaged_bars, login_state, set_login_start, unmanaged_bar_lines, LoginState,
 };
+use crate::bar::model::{Backend, BarConfig, KNOWN_MODULES};
 use crate::bar::process::{foreign_bars, log_file, start_bar, stop_bar, stop_foreign};
 use crate::core::actions::get_actions;
 use crate::core::items::{Bind, Monitor, Rule};
 use crate::core::manager::{detect_data_dir, ApplyResult, ConfigManager};
 use crate::core::schema::{get_schema_pages, search_options, OptionItem};
+use crate::palette::{
+    apply_bar_colors, palette_from_file, restart_bar_if_running, stage_window_colors, window_colors,
+};
 use crate::presets::{
     all_presets, apply_preset, current_preset_id, delete_user_preset, find_any_preset,
     overwrite_user_preset, rename_user_preset, save_user_preset,
-};
-use crate::palette::{
-    apply_bar_colors, palette_from_file, restart_bar_if_running, stage_window_colors, window_colors,
 };
 use crate::wallpaper::{current_wallpaper, set_wallpaper};
 
@@ -189,7 +189,10 @@ pub enum ColorsCommands {
     FromWallpaper {
         #[arg(long, help = "Window border colours (staged; written by `apply`)")]
         windows: bool,
-        #[arg(long, help = "Bar colours (saved, files written, restarted if running)")]
+        #[arg(
+            long,
+            help = "Bar colours (saved, files written, restarted if running)"
+        )]
         bar: bool,
         #[arg(long, help = "Also apply the staged window colours at once")]
         apply: bool,
@@ -257,7 +260,12 @@ pub enum RuleCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum MonitorCommands {
-    #[command(about = "Add a monitor rule for an output, e.g. eDP-1")]
+    #[command(
+        about = "Add or update the monitor rule for an output, e.g. eDP-1",
+        long_about = "Add or update the monitor rule for an output, e.g. eDP-1. If a managed \
+                      rule for that output exists it is updated in place: options you leave \
+                      out keep their current value."
+    )]
     Add {
         name: String,
         #[arg(long)]
@@ -287,6 +295,11 @@ pub enum MonitorCommands {
 
     #[command(about = "Remove a managed monitor rule by its number in `monitor list`")]
     Remove { number: usize },
+
+    #[command(
+        about = "Remove duplicate monitor rules, keeping the first per output (the one Mango uses)"
+    )]
+    Dedupe,
 }
 
 #[derive(Subcommand, Debug)]
@@ -396,9 +409,7 @@ pub enum BarCommands {
         flags: BarFlags,
     },
 
-    #[command(
-        about = "Start the bar at login (staged exec_once in mango-mod.conf; run `apply`)"
-    )]
+    #[command(about = "Start the bar at login (staged exec_once in mango-mod.conf; run `apply`)")]
     Login {
         #[arg(value_name = "on|off", help = "Leave out to show the state")]
         state: Option<String>,
@@ -427,7 +438,9 @@ pub enum BarCommands {
     #[command(about = "List the bar modules")]
     Modules,
 
-    #[command(about = "Custom bar buttons: an emoji or picture that plays a sound, runs a command or opens an app")]
+    #[command(
+        about = "Custom bar buttons: an emoji or picture that plays a sound, runs a command or opens an app"
+    )]
     Button {
         #[command(subcommand)]
         action: ButtonCommands,
@@ -443,7 +456,10 @@ pub enum ButtonCommands {
     Add {
         #[arg(long, help = "Emoji shown in the bar")]
         emoji: Option<String>,
-        #[arg(long, help = "Picture shown in the bar (Waybar only; copied to the data dir)")]
+        #[arg(
+            long,
+            help = "Picture shown in the bar (Waybar only; copied to the data dir)"
+        )]
         picture: Option<PathBuf>,
         #[arg(long, help = "Tooltip (Waybar); the text when there is no icon")]
         label: Option<String>,
@@ -455,7 +471,10 @@ pub enum ButtonCommands {
         command: Option<String>,
         #[arg(long, help = "Left click: app desktop id, e.g. firefox.desktop")]
         app: Option<String>,
-        #[arg(long, help = "Right click: audio file (any right-* flag gives right click its own action)")]
+        #[arg(
+            long,
+            help = "Right click: audio file (any right-* flag gives right click its own action)"
+        )]
         right_sound: Option<String>,
         #[arg(long, help = "Right click: shell command")]
         right_command: Option<String>,
@@ -687,7 +706,11 @@ fn run_bar_button(action: ButtonCommands, data_dir: &Path) -> Result<()> {
                     place,
                     b.left.summary(),
                     right,
-                    if b.picture.is_empty() { "" } else { " (picture)" }
+                    if b.picture.is_empty() {
+                        ""
+                    } else {
+                        " (picture)"
+                    }
                 );
             }
         }
@@ -760,8 +783,8 @@ fn run_bar_login(action: BarCommands, mgr: &mut ConfigManager) -> Result<()> {
                 println!("Start bar at login: {}", text);
                 return Ok(());
             };
-            let enabled = crate::core::values::parse_bool(&state)
-                .ok_or_else(|| anyhow!("use on or off"))?;
+            let enabled =
+                crate::core::values::parse_bool(&state).ok_or_else(|| anyhow!("use on or off"))?;
             let (mut bar, path) = load_bar(&mgr.data_dir)?;
             if bar.start_at_login != enabled {
                 bar.start_at_login = enabled;
@@ -942,7 +965,12 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                     if current.as_deref() == Some(p.id.as_str()) {
                         marks.push_str(" (current)");
                     }
-                    println!("  - {:<16} {}{}", p.id.yellow(), p.name.bold(), marks.dimmed());
+                    println!(
+                        "  - {:<16} {}{}",
+                        p.id.yellow(),
+                        p.name.bold(),
+                        marks.dimmed()
+                    );
                     if !p.description.is_empty() {
                         println!("    {}", p.description.dimmed());
                     }
@@ -1106,19 +1134,23 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                     disable,
                     primary,
                 };
-                let rule = mon.to_rule()?;
-                let line = rule.to_config_line();
-                let earlier =
-                    mgr.staged().rules.iter().position(|r| {
-                        r.kind == "monitor_rule" && r.get("name") == rule.get("name")
-                    });
-                mgr.add_rule(rule)?;
-                println!("Staged: {}", line.green());
-                if earlier.is_some() {
+                let up = mgr.upsert_monitor_rule(mon.to_rule()?, &[])?;
+                let line = up.rule.to_config_line();
+                match &up.replaced {
+                    Some(old) if *old == up.rule => {
+                        println!("Unchanged: {}", line.green())
+                    }
+                    Some(old) => println!(
+                        "Staged: {} (replaces {})",
+                        line.green(),
+                        old.to_config_line().dimmed()
+                    ),
+                    None => println!("Staged: {}", line.green()),
+                }
+                if up.removed_duplicates > 0 {
                     println!(
-                        "{}: a managed monitor rule for {} already exists and Mango uses the \
-                         first match; remove the old one with `mangowm-mod monitor remove`",
-                        "warning".yellow(),
+                        "Removed {} older duplicate rule(s) for {}",
+                        up.removed_duplicates,
                         mon.name.trim()
                     );
                 }
@@ -1143,8 +1175,35 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 if rules.is_empty() {
                     println!("No managed monitor rules.");
                 }
+                let mut seen: Vec<&str> = Vec::new();
+                let mut shadowed = 0;
                 for (i, r) in rules.iter().enumerate() {
-                    println!("  {:>3}. {}", i + 1, r.to_config_line());
+                    let name = r.get("name").unwrap_or_default();
+                    if seen.contains(&name) {
+                        shadowed += 1;
+                        println!(
+                            "  {:>3}. {}  {}",
+                            i + 1,
+                            r.to_config_line().dimmed(),
+                            "(ignored: an earlier rule matches)".yellow()
+                        );
+                    } else {
+                        seen.push(name);
+                        println!("  {:>3}. {}", i + 1, r.to_config_line());
+                    }
+                }
+                if shadowed > 0 {
+                    println!("Run `mangowm-mod monitor dedupe` to remove the ignored duplicates.");
+                }
+            }
+
+            MonitorCommands::Dedupe => {
+                let n = mgr.dedupe_monitor_rules()?;
+                if n == 0 {
+                    println!("No duplicate monitor rules.");
+                } else {
+                    println!("Staged removal of {} duplicate monitor rule(s)", n);
+                    staged_hint();
                 }
             }
 
@@ -1189,7 +1248,11 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 if preview {
                     return Ok(());
                 }
-                let (windows, bar) = if windows || bar { (windows, bar) } else { (true, true) };
+                let (windows, bar) = if windows || bar {
+                    (windows, bar)
+                } else {
+                    (true, true)
+                };
                 if bar {
                     let cfg = apply_bar_colors(&palette, &mgr.data_dir, None)?;
                     let dir = bar_dir(cfg.backend);

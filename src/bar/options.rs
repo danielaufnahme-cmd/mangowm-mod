@@ -140,7 +140,12 @@ const NETWORK: &[ModuleOpt] = &[
     mangobar("icon-wifi", "Wi-Fi icon", Text),
     mangobar("icon-ethernet", "Ethernet icon", Text),
     mangobar("icon-disconnected", "Disconnected icon", Text),
-    renamed("signal-icons", "format-icons", "Signal icons (comma-separated)", List),
+    renamed(
+        "signal-icons",
+        "format-icons",
+        "Signal icons (comma-separated)",
+        List,
+    ),
     both("interval", "Update interval (s)", Int),
 ];
 const BATTERY: &[ModuleOpt] = &[
@@ -203,8 +208,9 @@ pub fn parse_opt_value(kind: OptKind, text: &str) -> anyhow::Result<Value> {
                 .ok_or_else(|| anyhow::anyhow!("{:?} is not true or false", t))?,
         ),
         // a JSON array is taken as typed
-        List | IntList if t.starts_with('[') => serde_json::from_str(t)
-            .map_err(|e| anyhow::anyhow!("invalid list {:?}: {}", t, e))?,
+        List | IntList if t.starts_with('[') => {
+            serde_json::from_str(t).map_err(|e| anyhow::anyhow!("invalid list {:?}: {}", t, e))?
+        }
         List => Value::from(list()),
         IntList => Value::from(
             list()

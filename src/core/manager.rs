@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use super::backup::BackupStore;
 use super::fsutil::{atomic_write, read_text};
 use super::ipc::{MangoIpc, ReloadStatus};
-use super::items::{Bind, Rule};
+use super::items::{dedupe_monitor_rules, merge_rule, monitor_rule_indexes, Bind, Monitor, Rule};
 use super::managed::{
     has_source_line, read_managed, render, source_value, with_source_line, ManagedState,
 };
@@ -42,6 +42,17 @@ bind=Alt,space,spawn,rofi -show drun
 bind=ALT,q,killclient,
 bind=SUPER,m,quit
 ";
+
+/// What `upsert_monitor_rule` staged.
+#[derive(Debug, Clone)]
+pub struct MonitorUpsert {
+    /// The rule now staged for the output.
+    pub rule: Rule,
+    /// The managed rule it replaced, if there was one.
+    pub replaced: Option<Rule>,
+    /// Older duplicate rules for the same output that were dropped.
+    pub removed_duplicates: usize,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ApplyResult {
@@ -318,6 +329,72 @@ impl ConfigManager {
         let r = self.staged.rules.remove(idx);
         self.save_staged()?;
         Ok(r)
+    }
+
+    /// Stage a `monitor_rule`, replacing the managed rule for the same output
+    /// instead of adding another one (Mango only uses the first match).
+    /// `rule` is merged into the existing rule, so keys it leaves out are
+    /// kept, except the ones in `clear` (e.g. fields a prefilled form emptied).
+    /// Later duplicates for the same name are dropped.
+    pub fn upsert_monitor_rule(&mut self, rule: Rule, clear: &[&str]) -> Result<MonitorUpsert> {
+        if rule.kind != "monitor_rule" {
+            bail!("not a monitor rule: {}", rule.to_config_line());
+        }
+        rule.validate()?;
+        let name = rule
+            .get("name")
+            .ok_or_else(|| anyhow!("a monitor rule needs a name"))?
+            .to_string();
+        let idx = monitor_rule_indexes(&self.staged.rules, &name);
+        let Some(&first) = idx.first() else {
+            self.staged.rules.push(rule.clone());
+            self.save_staged()?;
+            return Ok(MonitorUpsert {
+                rule,
+                replaced: None,
+                removed_duplicates: 0,
+            });
+        };
+        let old = self.staged.rules[first].clone();
+        let merged = merge_rule(&old, &rule, clear);
+        merged.validate()?;
+        let mon = Monitor::from_rule(&merged);
+        if mon.width.is_some() != mon.height.is_some() {
+            bail!("set both width and height (or neither)");
+        }
+        self.staged.rules[first] = merged.clone();
+        for &i in idx[1..].iter().rev() {
+            self.staged.rules.remove(i);
+        }
+        self.save_staged()?;
+        Ok(MonitorUpsert {
+            rule: merged,
+            replaced: Some(old),
+            removed_duplicates: idx.len() - 1,
+        })
+    }
+
+    /// Remove every managed `monitor_rule` for `name`; returns how many.
+    pub fn remove_monitor_rules(&mut self, name: &str) -> Result<usize> {
+        let idx = monitor_rule_indexes(&self.staged.rules, name);
+        if idx.is_empty() {
+            bail!("no managed monitor rule for {}", name);
+        }
+        for &i in idx.iter().rev() {
+            self.staged.rules.remove(i);
+        }
+        self.save_staged()?;
+        Ok(idx.len())
+    }
+
+    /// Collapse duplicate managed monitor rules, keeping the first per name
+    /// (the one Mango uses). Returns how many were removed.
+    pub fn dedupe_monitor_rules(&mut self) -> Result<usize> {
+        let n = dedupe_monitor_rules(&mut self.staged.rules);
+        if n > 0 {
+            self.save_staged()?;
+        }
+        Ok(n)
     }
 
     /// `monitor_rule` lines in the user's own config that match `name`.

@@ -82,7 +82,11 @@ fn test_mangobar_config_and_style() {
     assert!(!css.contains("rgba("));
     assert!(css.contains("background-color: #00000000"));
     // one family for Mangobar: the Nerd Font, for the icons
-    assert!(css.contains("font-family: \"JetBrainsMono Nerd Font\";"), "{}", css);
+    assert!(
+        css.contains("font-family: \"JetBrainsMono Nerd Font\";"),
+        "{}",
+        css
+    );
     assert!(css.contains("margin-top: 6px;"));
     assert!(!css.contains("#workspaces"));
 
@@ -144,7 +148,11 @@ fn test_waybar_config_and_style() {
     assert!(css.contains("rgba(19, 19, 22, 0.7216)"), "{}", css);
     assert!(!css.contains("#131316"));
     assert!(css.contains("font-family: \"Adwaita Sans\", \"JetBrainsMono Nerd Font\";"));
-    assert!(css.contains("border: 1px solid rgba(255, 255, 255, 0.0588);"), "{}", css);
+    assert!(
+        css.contains("border: 1px solid rgba(255, 255, 255, 0.0588);"),
+        "{}",
+        css
+    );
     for id in [
         "#workspaces button",
         "#workspaces button.active",
@@ -354,7 +362,8 @@ fn test_all_options_reach_both_programs() {
         ("border-width", "2"),
         ("border-color", "#abcdef80"),
     ] {
-        bar.set(k, v).unwrap_or_else(|e| panic!("{}={}: {}", k, v, e));
+        bar.set(k, v)
+            .unwrap_or_else(|e| panic!("{}={}: {}", k, v, e));
     }
     assert!(bar.set("position", "left").is_err());
     assert!(bar.set("font-weight", "heavy").is_err());
@@ -600,10 +609,7 @@ fn test_start_at_login_writes_exec_once() {
     assert!(cmd.contains("mangowm-mod bar start"), "{}", cmd);
     // not the default data dir: the command says where the bar settings are
     assert!(
-        cmd.ends_with(&format!(
-            "--data-dir {}",
-            tmp.path().join("data").display()
-        )),
+        cmd.ends_with(&format!("--data-dir {}", tmp.path().join("data").display())),
         "{}",
         cmd
     );
@@ -630,7 +636,8 @@ fn test_migrate_comments_out_bare_waybar() {
     use mangowm_mod::bar::login::{disable_unmanaged_bars, unmanaged_bar_lines};
     let tmp = tempdir().unwrap();
     let cfg = tmp.path().join("config.conf");
-    let original = "border_px=2\nexec_once=mako\nexec_once=waybar\n  exec_once = mangobar -c /x.jsonc\n\
+    let original =
+        "border_px=2\nexec_once=mako\nexec_once=waybar\n  exec_once = mangobar -c /x.jsonc\n\
                     exec_once=waybar -c /home/u/.config/waybar/mango-mod/config.jsonc\n\
                     # exec_once=waybar\nexec_once=waybar-helper\nsource=./mango-mod.conf\n";
     std::fs::write(&cfg, original).unwrap();
@@ -647,7 +654,11 @@ fn test_migrate_comments_out_bare_waybar() {
     let (id, n) = disable_unmanaged_bars(&cfg, &mgr.backups).unwrap().unwrap();
     assert_eq!(n, 2);
     let text = std::fs::read_to_string(&cfg).unwrap();
-    assert!(text.contains("\n# exec_once=waybar  # disabled by MangoWM Mod"), "{}", text);
+    assert!(
+        text.contains("\n# exec_once=waybar  # disabled by MangoWM Mod"),
+        "{}",
+        text
+    );
     assert!(text.contains("\n# exec_once = mangobar -c /x.jsonc  # disabled"));
     assert!(text.contains("\nexec_once=mako\n"));
     assert!(text.contains("\nexec_once=waybar -c /home/u/.config/waybar/mango-mod/config.jsonc\n"));
@@ -662,10 +673,14 @@ fn test_migrate_comments_out_bare_waybar() {
 
     // nothing to do: no backup, no change
     std::fs::write(&cfg, "exec_once=mako\n").unwrap();
-    assert!(disable_unmanaged_bars(&cfg, &mgr.backups).unwrap().is_none());
-    assert!(disable_unmanaged_bars(&tmp.path().join("missing.conf"), &mgr.backups)
+    assert!(disable_unmanaged_bars(&cfg, &mgr.backups)
         .unwrap()
         .is_none());
+    assert!(
+        disable_unmanaged_bars(&tmp.path().join("missing.conf"), &mgr.backups)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// fcft ascent + descent of JetBrainsMono Nerd Font (what Mangobar loads),
@@ -693,8 +708,14 @@ fn test_auto_height_fits_the_font() {
                             height,
                             ..Default::default()
                         };
-                        let what = format!("{:?} font {} margin {} border {} height {:?}",
-                            backend, font_size, module_margin, border, (auto, height));
+                        let what = format!(
+                            "{:?} font {} margin {} border {} height {:?}",
+                            backend,
+                            font_size,
+                            module_margin,
+                            border,
+                            (auto, height)
+                        );
                         // the module's content box holds the text line
                         assert!(bar.module_height() >= line_height(font_size), "{}", what);
                         assert!(bar.module_height() >= bar.module_min_height(), "{}", what);
@@ -754,12 +775,17 @@ fn test_window_title_is_capped() {
 
     // the module's own option wins; 0 = no cap
     bar.set("window.max-length", "30").unwrap();
-    assert_eq!(parse(&generate_config(&bar))["mango/window"]["max-length"], 30);
+    assert_eq!(
+        parse(&generate_config(&bar))["mango/window"]["max-length"],
+        30
+    );
     bar.unset("window.max-length");
     bar.set("title-length", "0").unwrap();
     assert!(parse(&generate_config(&bar)).get("mango/window").is_none());
     bar.set("backend", "mangobar").unwrap();
-    assert!(parse(&generate_config(&bar))["window"].get("max-length").is_none());
+    assert!(parse(&generate_config(&bar))["window"]
+        .get("max-length")
+        .is_none());
 }
 
 #[test]
@@ -769,7 +795,10 @@ fn test_bar_presets() {
     assert!((4..=6).contains(&BAR_PRESETS.len()));
     // a fresh bar.json is the default preset
     let default = find_bar_preset(DEFAULT_BAR_PRESET).unwrap();
-    assert_eq!(default.applied_to(&BarConfig::default()), BarConfig::default());
+    assert_eq!(
+        default.applied_to(&BarConfig::default()),
+        BarConfig::default()
+    );
 
     for p in BAR_PRESETS {
         for backend in [Backend::Mangobar, Backend::Waybar] {
@@ -787,7 +816,13 @@ fn test_bar_presets() {
             assert!(bar.auto_height, "{}", what);
             // the user's custom and hardware modules are kept, before the tray
             let right = &bar.modules.right;
-            for m in ["custom/power", "backlight", "keyboardlayout", "hideclients", "keymode"] {
+            for m in [
+                "custom/power",
+                "backlight",
+                "keyboardlayout",
+                "hideclients",
+                "keymode",
+            ] {
                 assert!(bar.modules.all().any(|x| x == m), "{}: {} dropped", what, m);
             }
             assert_eq!(right.last().map(String::as_str), Some("tray"), "{}", what);
@@ -798,14 +833,27 @@ fn test_bar_presets() {
             assert!(bar.module_height() >= bar.module_min_height(), "{}", what);
             assert!(v["modules-left"].as_array().is_some_and(|l| !l.is_empty()));
             let css = generate_style(&bar);
-            assert_eq!(css.matches('{').count(), css.matches('}').count(), "{}", what);
+            assert_eq!(
+                css.matches('{').count(),
+                css.matches('}').count(),
+                "{}",
+                what
+            );
             match backend {
                 Backend::Mangobar => {
-                    assert!(css.contains("#bar {") && css.contains("#tags.active {"), "{}", what);
+                    assert!(
+                        css.contains("#bar {") && css.contains("#tags.active {"),
+                        "{}",
+                        what
+                    );
                     // Mangobar reads only hex colors
                     assert!(!css.contains("rgba(") && !css.contains("none"), "{}", what);
                     if mangobar_continuous(&bar) {
-                        assert!(css.contains("margin: 0px 0px;"), "{}: holes in the bar", what);
+                        assert!(
+                            css.contains("margin: 0px 0px;"),
+                            "{}: holes in the bar",
+                            what
+                        );
                     }
                 }
                 Backend::Waybar => {

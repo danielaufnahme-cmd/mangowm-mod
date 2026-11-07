@@ -2,8 +2,8 @@ use image::{DynamicImage, Rgb as Px, RgbImage, Rgba, RgbaImage};
 use mangowm_mod::bar::model::BarConfig;
 use mangowm_mod::core::manager::ConfigManager;
 use mangowm_mod::palette::{
-    apply_bar_colors, bar_colors, contrast, palette_from_file, palette_from_image,
-    save_bar_colors, stage_window_colors, window_colors, MatchSettings, Palette, Rgb, MIN_ACCENT_CONTRAST,
+    apply_bar_colors, bar_colors, contrast, palette_from_file, palette_from_image, save_bar_colors,
+    stage_window_colors, window_colors, MatchSettings, Palette, Rgb, MIN_ACCENT_CONTRAST,
     MIN_MUTED_CONTRAST, MIN_TEXT_CONTRAST,
 };
 use std::fs;
@@ -40,9 +40,13 @@ fn grey_gradient() -> DynamicImage {
 
 /// Small deterministic noise generator (no rand dependency).
 fn noise(seed: u64) -> DynamicImage {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut s = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let mut next = move || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (s >> 33) as u8
     };
     let base = [next(), next(), next()];
@@ -79,11 +83,28 @@ fn assert_readable(p: &Palette, what: &str) {
         bg.hex(),
         contrast(p.accent, bg)
     );
-    assert!(contrast(p.urgent, bg) >= MIN_ACCENT_CONTRAST, "{}: urgent", what);
-    assert!(contrast(p.muted, bg) >= MIN_MUTED_CONTRAST, "{}: muted", what);
-    assert!(contrast(p.secondary, bg) >= MIN_MUTED_CONTRAST, "{}: secondary", what);
+    assert!(
+        contrast(p.urgent, bg) >= MIN_ACCENT_CONTRAST,
+        "{}: urgent",
+        what
+    );
+    assert!(
+        contrast(p.muted, bg) >= MIN_MUTED_CONTRAST,
+        "{}: muted",
+        what
+    );
+    assert!(
+        contrast(p.secondary, bg) >= MIN_MUTED_CONTRAST,
+        "{}: secondary",
+        what
+    );
     // a dark base: the bar and root colour stay calm
-    assert!(bg.luminance() < 0.05, "{}: background {} too light", what, bg.hex());
+    assert!(
+        bg.luminance() < 0.05,
+        "{}: background {} too light",
+        what,
+        bg.hex()
+    );
     assert!(p.surface.luminance() > bg.luminance(), "{}: surface", what);
 }
 
@@ -102,10 +123,18 @@ fn test_palette_takes_accent_from_picture() {
     assert!(a.r > a.g && a.g > a.b, "accent {} is not orange", a.hex());
     // the teal area tints the background: blue/green over red
     let bg = p.background;
-    assert!(bg.g > bg.r && bg.b > bg.r, "background {} is not teal", bg.hex());
+    assert!(
+        bg.g > bg.r && bg.b > bg.r,
+        "background {} is not teal",
+        bg.hex()
+    );
     // urgent is a red
     let u = p.urgent;
-    assert!(u.r > u.g + 40 && u.r > u.b + 40, "urgent {} is not red", u.hex());
+    assert!(
+        u.r > u.g + 40 && u.r > u.b + 40,
+        "urgent {} is not red",
+        u.hex()
+    );
 }
 
 #[test]
@@ -217,7 +246,11 @@ fn test_window_colors_staged_and_applied() {
     let res = mgr.apply().unwrap();
     assert!(res.errors.is_empty(), "{:?}", res.errors);
     let written = fs::read_to_string(tmp.path().join("mango-mod.conf")).unwrap();
-    assert!(written.contains(&format!("focus_color={}", accent)), "{}", written);
+    assert!(
+        written.contains(&format!("focus_color={}", accent)),
+        "{}",
+        written
+    );
     for (key, _) in window_colors(&p) {
         assert!(written.contains(&format!("{}=0x", key)), "{} missing", key);
     }
@@ -265,10 +298,8 @@ fn test_bar_colors_saved_and_files_written() {
     let style = fs::read_to_string(out.join("style.css")).unwrap();
     let accent = p.accent.hex();
     assert!(
-        style.to_lowercase().contains(&accent[1..]) || style.contains(&format!(
-            "{}, {}, {}",
-            p.accent.r, p.accent.g, p.accent.b
-        )),
+        style.to_lowercase().contains(&accent[1..])
+            || style.contains(&format!("{}, {}, {}", p.accent.r, p.accent.g, p.accent.b)),
         "accent {} not in style.css:\n{}",
         accent,
         style

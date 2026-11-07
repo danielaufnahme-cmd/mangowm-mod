@@ -161,11 +161,13 @@ mangowm-mod rule remove 1                # number from `rule list`
 
 ### monitor
 
-`monitor add NAME` with options `--width`, `--height`, `--refresh` (Hz), `--x`, `--y`, `--scale`, `--transform` (0-7), `--vrr true|false`, `--disable`, `--primary`.
+`monitor add NAME` with options `--width`, `--height`, `--refresh` (Hz), `--x`, `--y`, `--scale`, `--transform` (0-7), `--vrr true|false`, `--disable`, `--primary`. There is one managed rule per output: adding a rule for an output that already has one updates it in place, and options you leave out keep their current value. `monitor dedupe` removes duplicate rules left by older versions, keeping the first one (the one Mango uses).
 
 ```bash
 mangowm-mod monitor add eDP-1 --width 1920 --height 1080 --refresh 60 --scale 1
+mangowm-mod monitor add eDP-1 --scale 1.5   # only the scale changes
 mangowm-mod monitor list
+mangowm-mod monitor dedupe
 mangowm-mod monitor remove 1             # number from `monitor list`
 ```
 

@@ -3,7 +3,8 @@
 use anyhow::{anyhow, Result};
 use std::str::FromStr;
 
-use mangowm_mod::core::items::Rule;
+use mangowm_mod::core::items::{Monitor, Rule};
+use mangowm_mod::core::values::format_float;
 use mangowm_mod::core::values::parse_color;
 
 /// Any color Mango or the bar accepts, as RGBA floats 0..1.
@@ -88,6 +89,123 @@ pub fn rule_number(rules: &[Rule], kinds: &[&str], index: usize) -> Option<usize
     )
 }
 
+/// Common output scales offered in the Monitors form.
+pub const SCALE_PRESETS: &[f64] = &[1.0, 1.25, 1.5, 1.75, 2.0];
+
+/// Labels of the scale dropdown: "Not set", the presets, then "Custom".
+pub fn scale_labels() -> Vec<String> {
+    let mut v = vec!["Not set".to_string()];
+    v.extend(
+        SCALE_PRESETS
+            .iter()
+            .map(|s| format!("{}  ({}%)", format_float(*s), (s * 100.0).round())),
+    );
+    v.push("Custom".to_string());
+    v
+}
+
+/// Dropdown position for a scale: 0 = not set, then the presets, last = custom.
+pub fn scale_choice(scale: Option<f64>) -> usize {
+    match scale {
+        None => 0,
+        Some(s) => SCALE_PRESETS
+            .iter()
+            .position(|p| (p - s).abs() < 1e-6)
+            .map(|i| i + 1)
+            .unwrap_or(SCALE_PRESETS.len() + 1),
+    }
+}
+
+/// The scale a dropdown position (and the custom value) stands for.
+pub fn scale_from_choice(choice: usize, custom: f64) -> Option<f64> {
+    match choice {
+        0 => None,
+        i if i <= SCALE_PRESETS.len() => Some(SCALE_PRESETS[i - 1]),
+        _ => Some((custom * 100.0).round() / 100.0),
+    }
+}
+
+/// Labels of the transform dropdown: "Not set", then `rr` 0-7.
+pub const TRANSFORM_LABELS: &[&str] = &[
+    "Not set",
+    "Normal",
+    "Rotate 90°",
+    "Rotate 180°",
+    "Rotate 270°",
+    "Flipped",
+    "Flipped, 90°",
+    "Flipped, 180°",
+    "Flipped, 270°",
+];
+
+/// The first managed `monitor_rule` per output name, in file order, with how
+/// many later rules for the same name Mango ignores.
+pub fn monitor_entries(rules: &[Rule]) -> Vec<(Rule, usize)> {
+    let mut out: Vec<(Rule, usize)> = Vec::new();
+    for r in rules.iter().filter(|r| r.kind == "monitor_rule") {
+        match out
+            .iter_mut()
+            .find(|(f, _)| f.get("name").is_some() && f.get("name") == r.get("name"))
+        {
+            Some(e) => e.1 += 1,
+            None => out.push((r.clone(), 0)),
+        }
+    }
+    out
+}
+
+/// One-line description of a monitor rule, e.g. "2560 × 1440 @ 239.97 Hz · Scale 1".
+pub fn monitor_summary(rule: &Rule) -> String {
+    let m = Monitor::from_rule(rule);
+    let mut parts: Vec<String> = Vec::new();
+    if m.disable {
+        parts.push("Disabled".into());
+    }
+    match (rule.get("width"), rule.get("height"), rule.get("refresh")) {
+        (Some(w), Some(h), Some(r)) => parts.push(format!("{} × {} @ {} Hz", w, h, r)),
+        (Some(w), Some(h), None) => parts.push(format!("{} × {}", w, h)),
+        (_, _, Some(r)) => parts.push(format!("{} Hz", r)),
+        _ => {}
+    }
+    if let Some(s) = rule.get("scale") {
+        parts.push(format!("Scale {}", s));
+    }
+    if rule.get("x").is_some() || rule.get("y").is_some() {
+        parts.push(format!(
+            "Position {}, {}",
+            rule.get("x").unwrap_or("0"),
+            rule.get("y").unwrap_or("0")
+        ));
+    }
+    if let Some(t) = m.transform.filter(|t| *t > 0) {
+        if let Some(l) = TRANSFORM_LABELS.get(t as usize + 1) {
+            parts.push(l.to_string());
+        }
+    }
+    match m.vrr {
+        Some(true) => parts.push("VRR on".into()),
+        Some(false) => parts.push("VRR off".into()),
+        None => {}
+    }
+    if m.primary {
+        parts.push("Primary".into());
+    }
+    let known = [
+        "name", "width", "height", "refresh", "scale", "x", "y", "rr", "vrr", "disable", "primary",
+    ];
+    parts.extend(
+        rule.fields
+            .iter()
+            .filter(|(k, _)| !known.contains(&k.as_str()))
+            .map(|(k, v)| format!("{}:{}", k, v)),
+    );
+    if parts.is_empty() {
+        "Mango's defaults".into()
+    } else {
+        parts.join("  ·  ")
+    }
+}
+
 /// "2026-10-31 14:02" from a backup's RFC 3339 time.
 pub fn short_time(rfc3339: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(rfc3339)
@@ -145,5 +263,55 @@ mod tests {
         assert_eq!(rule_number(&rules, kinds, 1), None);
         assert_eq!(rule_number(&rules, kinds, 2), Some(2));
         assert_eq!(rule_number(&rules, &["monitor_rule"], 1), Some(1));
+    }
+
+    #[test]
+    fn scale_choices_round_trip() {
+        assert_eq!(scale_labels().len(), SCALE_PRESETS.len() + 2);
+        assert_eq!(scale_labels()[2], "1.25  (125%)");
+        assert_eq!(scale_choice(None), 0);
+        assert_eq!(scale_choice(Some(1.0)), 1);
+        assert_eq!(scale_choice(Some(1.5)), 3);
+        assert_eq!(scale_choice(Some(2.0)), 5);
+        assert_eq!(scale_choice(Some(1.7)), 6);
+        for i in 1..=SCALE_PRESETS.len() {
+            assert_eq!(scale_choice(scale_from_choice(i, 0.0)), i);
+        }
+        assert_eq!(scale_from_choice(0, 3.0), None);
+        assert_eq!(scale_from_choice(6, 1.6666), Some(1.67));
+    }
+
+    #[test]
+    fn monitor_entries_one_per_output() {
+        let rules: Vec<Rule> = [
+            ("monitor_rule", "name:DP-4,scale:1.5"),
+            ("window_rule", "app_id:mpv,is_floating:1"),
+            ("monitor_rule", "name:DP-4,scale:2"),
+            ("monitor_rule", "name:eDP-1,scale:1"),
+            ("monitor_rule", "name:DP-4,scale:3"),
+        ]
+        .iter()
+        .map(|(k, v)| Rule::parse(k, v).unwrap())
+        .collect();
+        let e = monitor_entries(&rules);
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0].0.get("scale"), Some("1.5"));
+        assert_eq!(e[0].1, 2);
+        assert_eq!(e[1].0.get("name"), Some("eDP-1"));
+        assert_eq!(e[1].1, 0);
+    }
+
+    #[test]
+    fn monitor_summaries() {
+        let r = Rule::parse(
+            "monitor_rule",
+            "name:DP-4,width:2560,height:1440,refresh:239.97,scale:1",
+        )
+        .unwrap();
+        assert_eq!(monitor_summary(&r), "2560 × 1440 @ 239.97 Hz  ·  Scale 1");
+        let r = Rule::parse("monitor_rule", "name:X,rr:1,vrr:1,hdr:1").unwrap();
+        assert_eq!(monitor_summary(&r), "Rotate 90°  ·  VRR on  ·  hdr:1");
+        let r = Rule::parse("monitor_rule", "name:X").unwrap();
+        assert_eq!(monitor_summary(&r), "Mango's defaults");
     }
 }

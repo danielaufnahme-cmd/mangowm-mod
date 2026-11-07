@@ -9,11 +9,14 @@ use anyhow::Result;
 
 use mangowm_mod::cli::RULE_ADD_KINDS;
 use mangowm_mod::core::actions::get_actions;
-use mangowm_mod::core::items::{rule_keys, Bind, Monitor, Rule};
+use mangowm_mod::core::items::{rule_keys, Bind, Monitor, Rule, MONITOR_FORM_KEYS};
 use mangowm_mod::core::manager::ConfigManager;
 
 use crate::ctx::Ctx;
-use crate::logic::{parse_optional, rule_number};
+use crate::logic::{
+    monitor_entries, monitor_summary, parse_optional, rule_number, scale_choice, scale_from_choice,
+    scale_labels, SCALE_PRESETS, TRANSFORM_LABELS,
+};
 
 /// A group whose rows are rebuilt when the staged lines change.
 struct ListGroup {
@@ -112,13 +115,26 @@ fn form_dialog(
     groups: &[adw::PreferencesGroup],
     submit: impl Fn(&mut ConfigManager) -> Result<Vec<String>> + 'static,
 ) {
+    form_dialog_with(ctx, parent, title, "Add", groups, submit);
+}
+
+/// `form_dialog` with its own button label; returns the dialog and the button
+/// so the caller can retitle them.
+fn form_dialog_with(
+    ctx: &Ctx,
+    parent: &impl IsA<gtk::Widget>,
+    title: &str,
+    action_label: &str,
+    groups: &[adw::PreferencesGroup],
+    submit: impl Fn(&mut ConfigManager) -> Result<Vec<String>> + 'static,
+) -> (adw::Dialog, gtk::Button) {
     let page = adw::PreferencesPage::new();
     for g in groups {
         page.add(g);
     }
     let banner = adw::Banner::new("");
     let add = gtk::Button::builder()
-        .label("Add")
+        .label(action_label)
         .css_classes(["suggested-action"])
         .build();
     let header = adw::HeaderBar::new();
@@ -150,6 +166,7 @@ fn form_dialog(
         }
     });
     dialog.present(Some(parent));
+    (dialog, add)
 }
 
 fn items_page(title: &str, description: &str) -> adw::PreferencesPage {
@@ -419,15 +436,47 @@ pub fn rules_page(ctx: &Ctx) -> adw::PreferencesPage {
 
 // ------------------------------------------------------------------ monitors
 
-fn add_monitor_dialog(ctx: &Ctx, parent: &impl IsA<gtk::Widget>) {
-    let name = entry("Output name, e.g. eDP-1", "");
+/// The managed rule Mango uses for output `name` (the first one), if any.
+fn managed_monitor_rule(m: &ConfigManager, name: &str) -> Option<Rule> {
+    m.staged()
+        .rules
+        .iter()
+        .find(|r| r.kind == "monitor_rule" && r.get("name") == Some(name))
+        .cloned()
+}
+
+/// Add (`existing` = None) or edit the monitor rule of one output. The form is
+/// prefilled from the managed rule, also when an existing output name is
+/// typed into the Add form, and saving replaces that rule.
+fn monitor_dialog(ctx: &Ctx, parent: &impl IsA<gtk::Widget>, existing: Option<Rule>) {
+    let name = entry("Output name, e.g. eDP-1 or DP-4", "");
     let width = entry("Width", "");
     let height = entry("Height", "");
     let refresh = entry("Refresh rate (Hz)", "");
     let x = entry("Position X", "");
     let y = entry("Position Y", "");
-    let scale = entry("Scale", "");
-    let transform = entry("Transform 0-7 (rotation / flip)", "");
+    let labels = scale_labels();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let scale = adw::ComboRow::builder()
+        .title("Scale")
+        .model(&gtk::StringList::new(&label_refs))
+        .build();
+    let custom_scale = adw::SpinRow::builder()
+        .title("Custom scale")
+        .digits(2)
+        .adjustment(&gtk::Adjustment::new(1.0, 0.25, 10.0, 0.05, 0.25, 0.0))
+        .visible(false)
+        .build();
+    {
+        let custom_scale = custom_scale.clone();
+        scale.connect_selected_notify(move |c| {
+            custom_scale.set_visible(c.selected() as usize == SCALE_PRESETS.len() + 1);
+        });
+    }
+    let transform = adw::ComboRow::builder()
+        .title("Rotation")
+        .model(&gtk::StringList::new(TRANSFORM_LABELS))
+        .build();
     let vrr = adw::ComboRow::builder()
         .title("Variable refresh rate")
         .model(&gtk::StringList::new(&["Not set", "On", "Off"]))
@@ -439,33 +488,95 @@ fn add_monitor_dialog(ctx: &Ctx, parent: &impl IsA<gtk::Widget>) {
 
     let output = adw::PreferencesGroup::new();
     output.add(&name);
-    let mode = adw::PreferencesGroup::builder()
-        .title("Mode")
+    let display = adw::PreferencesGroup::builder()
+        .title("Display")
         .description("Leave a field empty to keep Mango's choice")
         .build();
-    for w in [&width, &height, &refresh, &x, &y, &scale, &transform] {
-        mode.add(w);
+    display.add(&scale);
+    display.add(&custom_scale);
+    for w in [&width, &height, &refresh] {
+        display.add(w);
     }
-    mode.add(&vrr);
+    let layout = adw::PreferencesGroup::builder().title("Layout").build();
+    layout.add(&x);
+    layout.add(&y);
+    layout.add(&transform);
+    layout.add(&vrr);
     let flags = adw::PreferencesGroup::new();
     flags.add(&disable);
     flags.add(&primary);
 
-    form_dialog(
-        ctx,
-        parent,
-        "Add Monitor Rule",
-        &[output, mode, flags],
-        move |m| {
+    // Output the form was filled from; saving then replaces exactly its fields.
+    let filled_from: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let fill = {
+        let (width, height, refresh, x, y) = (
+            width.clone(),
+            height.clone(),
+            refresh.clone(),
+            x.clone(),
+            y.clone(),
+        );
+        let (scale, custom_scale, transform, vrr) = (
+            scale.clone(),
+            custom_scale.clone(),
+            transform.clone(),
+            vrr.clone(),
+        );
+        let (disable, primary) = (disable.clone(), primary.clone());
+        let filled_from = filled_from.clone();
+        move |rule: &Rule| {
+            let mon = Monitor::from_rule(rule);
+            let text = |k: &str| rule.get(k).unwrap_or_default().to_string();
+            width.set_text(&text("width"));
+            height.set_text(&text("height"));
+            refresh.set_text(&text("refresh"));
+            x.set_text(&text("x"));
+            y.set_text(&text("y"));
+            let choice = scale_choice(mon.scale);
+            if let Some(s) = mon.scale {
+                custom_scale.set_value(s);
+            }
+            scale.set_selected(choice as u32);
+            custom_scale.set_visible(choice == SCALE_PRESETS.len() + 1);
+            transform.set_selected(mon.transform.map(|t| t as u32 + 1).unwrap_or(0));
+            vrr.set_selected(match mon.vrr {
+                Some(true) => 1,
+                Some(false) => 2,
+                None => 0,
+            });
+            disable.set_active(mon.disable);
+            primary.set_active(mon.primary);
+            *filled_from.borrow_mut() = Some(mon.name);
+        }
+    };
+
+    let editing = existing.is_some();
+    if let Some(rule) = &existing {
+        name.set_text(rule.get("name").unwrap_or_default());
+        name.set_editable(false);
+        fill(rule);
+    }
+    let title = match &existing {
+        Some(r) => format!("Edit {}", r.get("name").unwrap_or("Monitor")),
+        None => "Add Monitor".to_string(),
+    };
+
+    let submit = {
+        let name = name.clone();
+        let filled_from = filled_from.clone();
+        move |m: &mut ConfigManager| -> Result<Vec<String>> {
             let mon = Monitor {
-                name: name.text().to_string(),
+                name: name.text().trim().to_string(),
                 width: parse_optional("width", &width.text())?,
                 height: parse_optional("height", &height.text())?,
                 refresh: parse_optional("refresh", &refresh.text())?,
                 x: parse_optional("x", &x.text())?,
                 y: parse_optional("y", &y.text())?,
-                scale: parse_optional("scale", &scale.text())?,
-                transform: parse_optional("transform", &transform.text())?,
+                scale: scale_from_choice(scale.selected() as usize, custom_scale.value()),
+                transform: match transform.selected() {
+                    0 => None,
+                    t => Some((t - 1) as u8),
+                },
                 vrr: match vrr.selected() {
                     1 => Some(true),
                     2 => Some(false),
@@ -474,47 +585,210 @@ fn add_monitor_dialog(ctx: &Ctx, parent: &impl IsA<gtk::Widget>) {
                 disable: disable.is_active(),
                 primary: primary.is_active(),
             };
-            let rule = mon.to_rule()?;
-            let line = rule.to_config_line();
-            let earlier = m
-                .staged()
-                .rules
-                .iter()
-                .any(|r| r.kind == "monitor_rule" && r.get("name") == rule.get("name"));
-            m.add_rule(rule)?;
-            let mut msgs = vec![format!("Staged: {}", line)];
-            if earlier {
+            // A form filled from the rule shows all of its fields, so an emptied
+            // field is removed; otherwise fields left empty keep their value.
+            let clear: &[&str] = if filled_from.borrow().as_deref() == Some(mon.name.as_str()) {
+                MONITOR_FORM_KEYS
+            } else {
+                &[]
+            };
+            let up = m.upsert_monitor_rule(mon.to_rule()?, clear)?;
+            let mut msgs = vec![match &up.replaced {
+                Some(old) if *old == up.rule => format!("{} is unchanged", mon.name),
+                Some(_) => format!("Updated {}: {}", mon.name, monitor_summary(&up.rule)),
+                None => format!("Staged: {}", up.rule.to_config_line()),
+            }];
+            if up.removed_duplicates > 0 {
                 msgs.push(format!(
-                    "A managed monitor rule for {} already exists and Mango uses the first match; \
-                 remove the old one",
-                    mon.name.trim()
+                    "Removed {} ignored duplicate rule(s) for {}",
+                    up.removed_duplicates, mon.name
                 ));
             }
-            for own in m.user_monitor_rules_for(mon.name.trim()) {
+            for own in m.user_monitor_rules_for(&mon.name) {
                 msgs.push(format!(
                     "Your config already has `{}`. Mango uses the first matching monitor rule, so \
-                 remove that line for this one to take effect",
+                     remove that line for this one to take effect",
                     own
                 ));
             }
             Ok(msgs)
-        },
+        }
+    };
+
+    let (dialog, button) = form_dialog_with(
+        ctx,
+        parent,
+        &title,
+        if editing { "Save" } else { "Add" },
+        &[output, display, layout, flags],
+        submit,
     );
+
+    // Add form: typing the name of a managed output switches to editing it.
+    if !editing {
+        let ctx = ctx.clone();
+        let (dialog, button) = (dialog.downgrade(), button.downgrade());
+        name.connect_changed(move |e| {
+            let (Some(dialog), Some(button)) = (dialog.upgrade(), button.upgrade()) else {
+                return;
+            };
+            let typed = e.text().trim().to_string();
+            if filled_from.borrow().as_deref() == Some(typed.as_str()) {
+                return;
+            }
+            let found = managed_monitor_rule(&ctx.mgr.borrow(), &typed);
+            match found {
+                Some(rule) => {
+                    fill(&rule);
+                    dialog.set_title(&format!("Edit {}", typed));
+                    button.set_label("Save");
+                }
+                None => {
+                    if filled_from.borrow_mut().take().is_some() {
+                        dialog.set_title("Add Monitor");
+                        button.set_label("Add");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Warning row with a one-click cleanup of ignored duplicate monitor rules.
+fn duplicates_group(ctx: &Ctx) -> (adw::PreferencesGroup, adw::ActionRow) {
+    let row = adw::ActionRow::builder()
+        .title("Duplicate monitor rules")
+        .use_markup(false)
+        .build();
+    row.add_prefix(
+        &gtk::Image::builder()
+            .icon_name("dialog-warning-symbolic")
+            .css_classes(["warning"])
+            .build(),
+    );
+    let clean = gtk::Button::builder()
+        .label("Clean Up")
+        .tooltip_text("Keep the first rule per monitor (the one Mango uses); staged until Apply")
+        .valign(gtk::Align::Center)
+        .css_classes(["pill", "small"])
+        .build();
+    let c = ctx.clone();
+    clean.connect_clicked(move |_| {
+        if let Some(n) = c.stage(|m| m.dedupe_monitor_rules()) {
+            c.toast(&format!("Removed {} duplicate monitor rule(s)", n));
+        }
+    });
+    row.add_suffix(&clean);
+    row.set_activatable_widget(Some(&clean));
+    let group = adw::PreferencesGroup::builder().visible(false).build();
+    group.add(&row);
+    (group, row)
 }
 
 pub fn monitors_page(ctx: &Ctx) -> adw::PreferencesPage {
     let page = items_page(
         "Monitors",
-        "Monitor rules (resolution, position, scale, ...) written to mango-mod.conf",
+        "Resolution, refresh rate, scale and position per output, written to mango-mod.conf",
     );
-    let list = ListGroup::new("Managed Monitor Rules", "");
+    let (dup_group, dup_row) = duplicates_group(ctx);
+    page.add(&dup_group);
+    let list = ListGroup::new(
+        "Monitors",
+        "One rule per output. Click a monitor to change it",
+    );
     let add = add_button("Add Monitor");
     list.group.set_header_suffix(Some(&add));
     page.add(&list.group);
-    rule_list(ctx, list, &["monitor_rule"], "No managed monitor rules");
+
+    let refresh = {
+        let ctx = ctx.clone();
+        let page = page.clone();
+        move || {
+            let (rules, applied) = {
+                let mgr = ctx.mgr.borrow();
+                (mgr.staged().rules.clone(), mgr.managed().rules.clone())
+            };
+            let entries = monitor_entries(&rules);
+            let dups: usize = entries.iter().map(|e| e.1).sum();
+            dup_group.set_visible(dups > 0);
+            dup_row.set_subtitle(&format!(
+                "{} rule(s) are ignored because Mango only uses the first rule per monitor",
+                dups
+            ));
+            let sig = rules
+                .iter()
+                .filter(|r| r.kind == "monitor_rule")
+                .chain(applied.iter().filter(|r| r.kind == "monitor_rule"))
+                .map(|r| r.to_config_line())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let ctx = ctx.clone();
+            let page = page.clone();
+            list.set(
+                sig,
+                move || {
+                    entries
+                        .into_iter()
+                        .map(|(rule, dup)| monitor_row(&ctx, &page, rule, dup, &applied))
+                        .collect()
+                },
+                "No managed monitors. Mango picks each output's preferred mode",
+            );
+        }
+    };
+    refresh();
+    ctx.on_change(refresh);
     let (c, p) = (ctx.clone(), page.clone());
-    add.connect_clicked(move |_| add_monitor_dialog(&c, &p));
+    add.connect_clicked(move |_| monitor_dialog(&c, &p, None));
     page
+}
+
+/// One output: click to edit, trash to remove all of its managed rules.
+fn monitor_row(
+    ctx: &Ctx,
+    page: &adw::PreferencesPage,
+    rule: Rule,
+    duplicates: usize,
+    applied: &[Rule],
+) -> gtk::Widget {
+    let name = rule.get("name").unwrap_or_default().to_string();
+    let row = adw::ActionRow::builder()
+        .title(&name)
+        .subtitle(monitor_summary(&rule))
+        .use_markup(false)
+        .activatable(true)
+        .build();
+    row.add_prefix(&gtk::Image::from_icon_name("video-display-symbolic"));
+    if !applied.contains(&rule) {
+        row.add_css_class("modified");
+    }
+    if duplicates > 0 {
+        row.add_suffix(
+            &gtk::Label::builder()
+                .label(format!("+{} ignored", duplicates))
+                .tooltip_text("Later rules for this monitor that Mango ignores")
+                .css_classes(["dim-label", "caption"])
+                .valign(gtk::Align::Center)
+                .build(),
+        );
+    }
+    let rm = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Remove (staged until Apply)")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "circular"])
+        .build();
+    {
+        let (ctx, name) = (ctx.clone(), name.clone());
+        rm.connect_clicked(move |_| {
+            ctx.stage(|m| m.remove_monitor_rules(&name).map(|_| ()));
+        });
+    }
+    row.add_suffix(&rm);
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    let (ctx, page) = (ctx.clone(), page.clone());
+    row.connect_activated(move |_| monitor_dialog(&ctx, &page, Some(rule.clone())));
+    row.upcast()
 }
 
 // ------------------------------------------------------------------ autostart

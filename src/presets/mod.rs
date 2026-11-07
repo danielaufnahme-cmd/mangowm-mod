@@ -274,7 +274,11 @@ pub fn apply_preset(mgr: &mut ConfigManager, p: &Preset) -> Result<ApplyResult> 
     // Drop what another preset left behind (e.g. Glass's opacity) when this
     // preset does not set it; values the user picked themselves stay.
     for other in all_presets(&mgr.data_dir) {
-        for (k, v) in other.settings.iter().filter(|(k, _)| !p.settings.contains_key(*k)) {
+        for (k, v) in other
+            .settings
+            .iter()
+            .filter(|(k, _)| !p.settings.contains_key(*k))
+        {
             let from_preset = find_option(k)
                 .and_then(|o| format_option_value(&o.r#type, &o.choices, v).ok())
                 .is_some_and(|v| mgr.staged().settings.get(k) == Some(&v));

@@ -133,7 +133,9 @@ fn test_mangobar_button_config() {
     bar.button_mut("1").unwrap().picture = "/tmp/x.png".into();
     let cfg = config_json(&bar);
     assert_eq!(cfg["custom/btn-1"]["format"], "🔔");
-    assert!(warnings(&bar).iter().any(|w| w.contains("pictures need Waybar")));
+    assert!(warnings(&bar)
+        .iter()
+        .any(|w| w.contains("pictures need Waybar")));
     // no emoji: the label
     bar.button_mut("1").unwrap().emoji.clear();
     assert_eq!(config_json(&bar)["custom/btn-1"]["format"], "Ring");
@@ -154,7 +156,10 @@ fn test_waybar_button_config() {
     assert_eq!(m["format"], "🔔");
     assert_eq!(m["tooltip-format"], "Ring");
     assert!(m["on-click"].as_str().unwrap().ends_with("run 1 left"));
-    assert!(m["on-click-right"].as_str().unwrap().ends_with("run 1 right"));
+    assert!(m["on-click-right"]
+        .as_str()
+        .unwrap()
+        .ends_with("run 1 right"));
 
     // picture: Waybar's image module; the tooltip comes from its exec
     assert!(cfg["modules-left"]
@@ -165,7 +170,10 @@ fn test_waybar_button_config() {
     assert!(img["exec"].as_str().unwrap().contains("2-cat.png"));
     assert!(img["exec"].as_str().unwrap().contains("Cat & co"));
     assert!(img["size"].as_u64().unwrap() >= 16);
-    assert!(img["on-click-right"].as_str().unwrap().ends_with("run 2 right"));
+    assert!(img["on-click-right"]
+        .as_str()
+        .unwrap()
+        .ends_with("run 2 right"));
     let css = generate_style(&bar);
     assert!(css.contains("#image.btn-2"), "{}", css);
     assert!(css.contains("#custom-btn-1"), "{}", css);
@@ -279,7 +287,11 @@ fn test_click_argvs_and_missing_tools() {
 #[test]
 fn test_click_command_and_cli() {
     let cmd = click_command(Some(Path::new("/tmp/other data")), "3", Click::Right);
-    assert!(cmd.contains("bar button run 3 right --data-dir '/tmp/other data'"), "{}", cmd);
+    assert!(
+        cmd.contains("bar button run 3 right --data-dir '/tmp/other data'"),
+        "{}",
+        cmd
+    );
 
     let cli = Cli::try_parse_from(["mangowm-mod", "bar", "button", "run", "3", "right"]).unwrap();
     assert!(matches!(
@@ -300,13 +312,27 @@ fn test_cli_add_list_run_remove() {
     let pic = tmp.path().join("cat.png");
     fs::write(&pic, b"png").unwrap();
     let run = |args: &[&str]| {
-        let mut argv = vec!["mangowm-mod", "--data-dir", data.to_str().unwrap(), "bar", "button"];
+        let mut argv = vec![
+            "mangowm-mod",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "bar",
+            "button",
+        ];
         argv.extend(args);
         mangowm_mod::cli::run_cli(Cli::try_parse_from(argv).unwrap())
     };
     let cmd = format!("echo clicked >> '{}'", log.display());
-    run(&["add", "--emoji", "🐱", "--command", &cmd, "--picture", pic.to_str().unwrap()])
-        .unwrap();
+    run(&[
+        "add",
+        "--emoji",
+        "🐱",
+        "--command",
+        &cmd,
+        "--picture",
+        pic.to_str().unwrap(),
+    ])
+    .unwrap();
     run(&["list"]).unwrap();
     let bar = BarConfig::load(&data.join("bar.json")).unwrap();
     let b = bar.button("1").unwrap();
@@ -318,7 +344,10 @@ fn test_cli_add_list_run_remove() {
     run(&["run", "1", "left"]).unwrap();
     assert_eq!(wait_lines(&log, 1), ["clicked"]);
     run(&["remove", "1"]).unwrap();
-    assert!(BarConfig::load(&data.join("bar.json")).unwrap().buttons.is_empty());
+    assert!(BarConfig::load(&data.join("bar.json"))
+        .unwrap()
+        .buttons
+        .is_empty());
     assert!(run(&["run", "1", "left"]).is_err());
 }
 
@@ -342,8 +371,14 @@ fn test_memory_display_choices() {
         ("used-total", "{used:0.1f}/{total:0.0f} GB"),
         ("both", "{used:0.1f} GB · {percentage}%"),
     ];
-    assert_eq!(memory_displays(Backend::Waybar).len(), MEMORY_DISPLAYS.len());
-    assert_eq!(memory_displays(Backend::Mangobar), &[("percent", "Percent")]);
+    assert_eq!(
+        memory_displays(Backend::Waybar).len(),
+        MEMORY_DISPLAYS.len()
+    );
+    assert_eq!(
+        memory_displays(Backend::Mangobar),
+        &[("percent", "Percent")]
+    );
     for (display, fmt) in expect {
         let mut bar = BarConfig::default();
         bar.set("memory-display", display).unwrap();

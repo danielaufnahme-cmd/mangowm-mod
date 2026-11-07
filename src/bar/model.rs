@@ -646,7 +646,10 @@ impl BarConfig {
         if self.font_size < lo || self.font_size > hi {
             bail!("font size must be {}-{}", lo, hi);
         }
-        if !MEMORY_DISPLAYS.iter().any(|(d, _)| *d == self.memory_display) {
+        if !MEMORY_DISPLAYS
+            .iter()
+            .any(|(d, _)| *d == self.memory_display)
+        {
             bail!(
                 "memory display must be one of {}",
                 MEMORY_DISPLAYS
@@ -730,7 +733,9 @@ impl BarConfig {
         let radius = || -> Result<i32> {
             match value.trim() {
                 "pill" => Ok(-1),
-                v => v.parse().context("radius must be a number (-1 or pill = pill)"),
+                v => v
+                    .parse()
+                    .context("radius must be a number (-1 or pill = pill)"),
             }
         };
         match key {

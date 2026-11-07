@@ -236,7 +236,12 @@ fn is_picture(p: &Path) -> bool {
 
 fn pictures_in(dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| is_picture(p)).collect())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| is_picture(p))
+                .collect()
+        })
         .unwrap_or_default();
     out.sort();
     out

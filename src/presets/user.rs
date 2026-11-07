@@ -150,7 +150,11 @@ fn capture(mgr: &ConfigManager, p: &mut Preset, wallpaper: bool) {
         .into_iter()
         .filter_map(|k| mgr.get(&k).map(|v| (k, v)))
         .collect();
-    p.wallpaper = if wallpaper { staged_wallpaper(mgr) } else { None };
+    p.wallpaper = if wallpaper {
+        staged_wallpaper(mgr)
+    } else {
+        None
+    };
 }
 
 fn write_user_preset(data_dir: &Path, p: &Preset) -> Result<()> {
@@ -234,7 +238,6 @@ pub fn preset_modified(mgr: &ConfigManager, p: &Preset, wallpaper: Option<&Path>
         mgr.get(k)
             .map_or(true, |cur| normalized(k, &cur) != normalized(k, v))
     });
-    let wallpaper_changed =
-        wallpaper.is_some_and(|w| staged_wallpaper(mgr).as_deref() != Some(w));
+    let wallpaper_changed = wallpaper.is_some_and(|w| staged_wallpaper(mgr).as_deref() != Some(w));
     setting_changed || wallpaper_changed
 }

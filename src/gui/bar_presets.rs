@@ -23,7 +23,6 @@ const SCREEN_W: f64 = 600.0;
 /// Right-section modules drawn (plus the tray), so the card is not crowded.
 const RIGHT_MAX: usize = 2;
 
-
 fn set_color(cr: &cairo::Context, color: &str) {
     let c = color_to_rgba(color).unwrap_or([0.0, 0.0, 0.0, 1.0]);
     cr.set_source_rgba(c[0] as f64, c[1] as f64, c[2] as f64, c[3] as f64);
@@ -90,13 +89,17 @@ fn draw_bar(cr: &cairo::Context, bar: &BarConfig, w: f64, h: f64) {
     cr.scale(k, k);
     let height = bar.effective_height() as f64;
     let top = bar.margin_top as f64;
-    let (x0, x1) = (
-        bar.margin_left as f64,
-        SCREEN_W - bar.margin_right as f64,
-    );
+    let (x0, x1) = (bar.margin_left as f64, SCREEN_W - bar.margin_right as f64);
     // a window under the bar
     let wy = top + height + 8.0;
-    rounded_rect(cr, x0.max(8.0), wy, SCREEN_W - 2.0 * x0.max(8.0), h / k, 10.0);
+    rounded_rect(
+        cr,
+        x0.max(8.0),
+        wy,
+        SCREEN_W - 2.0 * x0.max(8.0),
+        h / k,
+        10.0,
+    );
     cr.set_source_rgba(0.08, 0.09, 0.11, 0.55);
     let _ = cr.fill();
 
@@ -116,17 +119,29 @@ fn draw_bar(cr: &cairo::Context, bar: &BarConfig, w: f64, h: f64) {
     cr.select_font_face(&family, cairo::FontSlant::Normal, weight);
     cr.set_font_size(bar.font_size as f64);
     let ext = cr.font_extents().ok();
-    let (ascent, descent) = ext.map(|e| (e.ascent(), e.descent())).unwrap_or((10.0, 3.0));
+    let (ascent, descent) = ext
+        .map(|e| (e.ascent(), e.descent()))
+        .unwrap_or((10.0, 3.0));
     let text_w = |t: &str| cr.text_extents(t).map(|e| e.x_advance()).unwrap_or(0.0);
 
     let waybar = bar.backend == Backend::Waybar;
     let continuous = mangobar_continuous(bar);
     let bw = if waybar { bar.border_width as f64 } else { 0.0 };
-    let pill = |r: i32, hh: f64| if r < 0 { hh / 2.0 } else { (r as f64).min(hh / 2.0) };
+    let pill = |r: i32, hh: f64| {
+        if r < 0 {
+            hh / 2.0
+        } else {
+            (r as f64).min(hh / 2.0)
+        }
+    };
 
     // the bar body: Waybar draws a rounded window, Mangobar a plain strip
     if alpha(&bar.bg_color) > 0 {
-        let r = if waybar { pill(bar.radius, height) } else { 0.0 };
+        let r = if waybar {
+            pill(bar.radius, height)
+        } else {
+            0.0
+        };
         rounded_rect(cr, x0, top, x1 - x0, height, r);
         set_color(cr, &bar.bg_color);
         let _ = cr.fill_preserve();
@@ -159,7 +174,11 @@ fn draw_bar(cr: &cairo::Context, bar: &BarConfig, w: f64, h: f64) {
             text_w(e.0) + 2.0 * pad
         };
         // Mangobar keeps tags at least as wide as the bar is tall
-        let body = if e.1 != Tag::No && !waybar { body.max(height) } else { body };
+        let body = if e.1 != Tag::No && !waybar {
+            body.max(height)
+        } else {
+            body
+        };
         body + 2.0 * gap
     };
     let group_w = |list: &[Entry]| {
@@ -203,7 +222,10 @@ fn draw_bar(cr: &cairo::Context, bar: &BarConfig, w: f64, h: f64) {
     };
 
     let mut right = entries(&bar.modules.right);
-    let tray = right.iter().position(|e| e.0.is_empty()).map(|i| right.remove(i));
+    let tray = right
+        .iter()
+        .position(|e| e.0.is_empty())
+        .map(|i| right.remove(i));
     right.truncate(RIGHT_MAX);
     right.extend(tray);
     let (left, center) = (entries(&bar.modules.left), entries(&bar.modules.center));
@@ -327,10 +349,8 @@ impl BarPage {
             .borrow_mut()
             .get_or_insert_with(|| list_user_presets(&self.ctx.data_dir))
             .clone();
-        let sig = serde_json::to_string(
-            &user.iter().map(|p| (&p.slug, p)).collect::<Vec<_>>(),
-        )
-        .unwrap_or_default();
+        let sig = serde_json::to_string(&user.iter().map(|p| (&p.slug, p)).collect::<Vec<_>>())
+            .unwrap_or_default();
         if self.presets.built_for.borrow().as_deref() != Some(sig.as_str()) {
             while let Some(child) = self.presets.flow.first_child() {
                 self.presets.flow.remove(&child);

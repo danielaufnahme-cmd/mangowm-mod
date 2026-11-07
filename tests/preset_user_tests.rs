@@ -40,7 +40,11 @@ fn test_save_apply_rename_overwrite_delete_round_trip() {
     let saved = save_user_preset(&mgr, "My Look", true).unwrap();
     assert_eq!(saved.id, "my-look");
     assert!(saved.user);
-    let file = tmp.path().join("data").join(USER_PRESET_DIR).join("my-look.json");
+    let file = tmp
+        .path()
+        .join("data")
+        .join(USER_PRESET_DIR)
+        .join("my-look.json");
     assert!(file.is_file());
     assert_eq!(saved.wallpaper.as_deref(), Some(pic.as_path()));
     // the same keys the built-in presets control
@@ -58,7 +62,10 @@ fn test_save_apply_rename_overwrite_delete_round_trip() {
     assert_eq!(users.len(), 1);
     assert_eq!(users[0], saved);
     assert_eq!(all_presets(&mgr.data_dir).len(), 13);
-    assert_eq!(find_any_preset(&mgr.data_dir, "my look").unwrap().id, "my-look");
+    assert_eq!(
+        find_any_preset(&mgr.data_dir, "my look").unwrap().id,
+        "my-look"
+    );
 
     // apply something else, then the user preset through the same path
     apply_preset(&mut mgr, &find_preset("latte").unwrap()).unwrap();
@@ -69,7 +76,10 @@ fn test_save_apply_rename_overwrite_delete_round_trip() {
     let text = fs::read_to_string(tmp.path().join("mango-mod.conf")).unwrap();
     assert!(text.contains("focus_color=0xff0000ff\n"), "{}", text);
     assert!(text.contains("border_radius=3\n"), "{}", text);
-    assert!(text.contains(&format!("exec_once=swaybg -m fill -i '{}'\n", pic.display())));
+    assert!(text.contains(&format!(
+        "exec_once=swaybg -m fill -i '{}'\n",
+        pic.display()
+    )));
     assert!(!text.contains("latte.png"), "{}", text);
     assert_eq!(current_preset_id(&mgr.data_dir).as_deref(), Some("my-look"));
     assert!(!modified(&mgr));
@@ -88,7 +98,10 @@ fn test_save_apply_rename_overwrite_delete_round_trip() {
     assert_eq!(over.name, "Evening");
     assert_eq!(over.wallpaper.as_deref(), Some(pic.as_path()));
     assert!(!modified(&mgr));
-    assert_eq!(list_user_presets(&mgr.data_dir)[0].settings["border_px"], "5");
+    assert_eq!(
+        list_user_presets(&mgr.data_dir)[0].settings["border_px"],
+        "5"
+    );
 
     // delete removes only that file
     delete_user_preset(&mgr.data_dir, "evening").unwrap();
@@ -165,7 +178,10 @@ fn test_user_preset_without_wallpaper_keeps_the_wallpaper() {
     let p = save_user_preset(&mgr, "Thick", false).unwrap();
     assert!(p.wallpaper.is_none());
     let json = fs::read_to_string(
-        tmp.path().join("data").join(USER_PRESET_DIR).join("thick.json"),
+        tmp.path()
+            .join("data")
+            .join(USER_PRESET_DIR)
+            .join("thick.json"),
     )
     .unwrap();
     assert!(!json.contains("wallpaper"), "{}", json);

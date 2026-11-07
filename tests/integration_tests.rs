@@ -1,4 +1,6 @@
-use mangowm_mod::core::items::{Bind, Monitor, Rule};
+use mangowm_mod::core::items::{
+    duplicate_monitor_rules, merge_rule, Bind, Monitor, Rule, MONITOR_FORM_KEYS,
+};
 use mangowm_mod::core::managed::{parse_managed, render, ManagedState};
 use mangowm_mod::core::manager::ConfigManager;
 use mangowm_mod::core::parser::strip_comment;
@@ -600,10 +602,17 @@ fn test_wallpaper_and_presets_share_one_line() {
     // a picked wallpaper replaces only the preset's wallpaper
     assert!(set_wallpaper(&mut mgr, &pic).unwrap().ok);
     let text = fs::read_to_string(tmp.path().join("mango-mod.conf")).unwrap();
-    assert!(text.contains(&format!("exec_once=swaybg -m fill -i '{}'\n", pic.display())));
+    assert!(text.contains(&format!(
+        "exec_once=swaybg -m fill -i '{}'\n",
+        pic.display()
+    )));
     assert_eq!(text.matches("exec_once=swaybg").count(), 1, "{}", text);
     assert!(text.contains("focus_color=0x88c0d0ff\n"), "{}", text);
-    assert!(text.contains("tag_rule=id:*,layout_name:tile\n"), "{}", text);
+    assert!(
+        text.contains("tag_rule=id:*,layout_name:tile\n"),
+        "{}",
+        text
+    );
     assert!(text.contains("exec_once=waybar\n"), "{}", text);
 
     // and a preset afterwards brings its own wallpaper back
@@ -659,4 +668,196 @@ fn test_collect_wallpapers_order_and_marks() {
     assert_eq!(mango_wallpaper(&mgr), Some(mango.clone()));
     mangowm_mod::wallpaper::set_wallpaper(&mut mgr, &plasma).unwrap();
     assert_eq!(mango_wallpaper(&mgr), Some(plasma));
+}
+
+fn mon(name: &str) -> Monitor {
+    Monitor {
+        name: name.into(),
+        ..Default::default()
+    }
+}
+
+fn monitor_lines(mgr: &ConfigManager) -> Vec<String> {
+    mgr.staged()
+        .rules
+        .iter()
+        .filter(|r| r.kind == "monitor_rule")
+        .map(|r| r.to_config_line())
+        .collect()
+}
+
+#[test]
+fn test_monitor_upsert_replaces_and_merges() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("config.conf"), "").unwrap();
+    let mut mgr = manager(tmp.path());
+    let first = Monitor {
+        width: Some(2560),
+        height: Some(1440),
+        refresh: Some(239.97),
+        scale: Some(1.5),
+        ..mon("DP-4")
+    };
+    let up = mgr
+        .upsert_monitor_rule(first.to_rule().unwrap(), &[])
+        .unwrap();
+    assert!(up.replaced.is_none());
+    mgr.add_rule(Rule::parse("window_rule", "app_id:mpv,is_floating:1").unwrap())
+        .unwrap();
+
+    // changing only the scale keeps width/height/refresh, in place
+    for scale in [2.0, 1.7, 1.0] {
+        let r = Monitor {
+            scale: Some(scale),
+            ..mon("DP-4")
+        };
+        let up = mgr.upsert_monitor_rule(r.to_rule().unwrap(), &[]).unwrap();
+        assert!(up.replaced.is_some());
+        assert_eq!(up.removed_duplicates, 0);
+    }
+    assert_eq!(
+        monitor_lines(&mgr),
+        vec!["monitor_rule=name:DP-4,width:2560,height:1440,refresh:239.97,scale:1"]
+    );
+    assert_eq!(mgr.staged().rules[0].kind, "monitor_rule");
+
+    // a new key is appended; another output gets its own rule
+    let r = Monitor {
+        vrr: Some(true),
+        ..mon("DP-4")
+    };
+    mgr.upsert_monitor_rule(r.to_rule().unwrap(), &[]).unwrap();
+    mgr.upsert_monitor_rule(
+        Monitor {
+            scale: Some(2.0),
+            ..mon("eDP-1")
+        }
+        .to_rule()
+        .unwrap(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        monitor_lines(&mgr),
+        vec![
+            "monitor_rule=name:DP-4,width:2560,height:1440,refresh:239.97,scale:1,vrr:1",
+            "monitor_rule=name:eDP-1,scale:2",
+        ]
+    );
+
+    // a prefilled form clears the fields it emptied but keeps keys it doesn't show
+    mgr.upsert_monitor_rule(
+        Rule::parse("monitor_rule", "name:eDP-1,scale:2,hdr:1").unwrap(),
+        &[],
+    )
+    .unwrap();
+    let form = Monitor {
+        width: Some(1920),
+        height: Some(1080),
+        ..mon("eDP-1")
+    };
+    mgr.upsert_monitor_rule(form.to_rule().unwrap(), MONITOR_FORM_KEYS)
+        .unwrap();
+    assert_eq!(
+        monitor_lines(&mgr)[1],
+        "monitor_rule=name:eDP-1,hdr:1,width:1920,height:1080"
+    );
+
+    // the merged rule is validated: half a mode is refused and nothing changes
+    let before = monitor_lines(&mgr);
+    let half = Rule::parse("monitor_rule", "name:eDP-1,width:800").unwrap();
+    assert!(mgr.upsert_monitor_rule(half, MONITOR_FORM_KEYS).is_err());
+    assert_eq!(monitor_lines(&mgr), before);
+    assert!(mgr
+        .upsert_monitor_rule(
+            Rule::parse("window_rule", "app_id:x,is_floating:1").unwrap(),
+            &[]
+        )
+        .is_err());
+
+    // staged state survives a reload (written to disk)
+    let again = manager(tmp.path());
+    assert_eq!(monitor_lines(&again), before);
+}
+
+#[test]
+fn test_monitor_upsert_collapses_duplicates() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("config.conf"), "").unwrap();
+    let mut mgr = manager(tmp.path());
+    // the user's broken state: five appended rules, the first one wins
+    for s in ["1.5", "2", "1.7", "1", "3"] {
+        mgr.add_rule(Rule::parse("monitor_rule", &format!("name:DP-4,scale:{}", s)).unwrap())
+            .unwrap();
+    }
+    let up = mgr
+        .upsert_monitor_rule(
+            Rule::parse("monitor_rule", "name:DP-4,refresh:239.97,scale:1.25").unwrap(),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(up.removed_duplicates, 4);
+    assert_eq!(
+        up.replaced.unwrap().to_config_line(),
+        "monitor_rule=name:DP-4,scale:1.5"
+    );
+    assert_eq!(
+        monitor_lines(&mgr),
+        vec!["monitor_rule=name:DP-4,scale:1.25,refresh:239.97"]
+    );
+}
+
+#[test]
+fn test_monitor_dedupe_keeps_first() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("config.conf"), "").unwrap();
+    let mut mgr = manager(tmp.path());
+    for (kind, body) in [
+        ("monitor_rule", "name:DP-4,scale:1.5"),
+        ("window_rule", "app_id:mpv,is_floating:1"),
+        ("monitor_rule", "name:DP-4,scale:2"),
+        ("monitor_rule", "name:eDP-1,scale:1"),
+        ("monitor_rule", "name:DP-4,scale:3"),
+        ("monitor_rule", "name:eDP-1,scale:2"),
+    ] {
+        mgr.add_rule(Rule::parse(kind, body).unwrap()).unwrap();
+    }
+    assert_eq!(duplicate_monitor_rules(&mgr.staged().rules), 3);
+    assert_eq!(mgr.dedupe_monitor_rules().unwrap(), 3);
+    assert_eq!(
+        monitor_lines(&mgr),
+        vec![
+            "monitor_rule=name:DP-4,scale:1.5",
+            "monitor_rule=name:eDP-1,scale:1",
+        ]
+    );
+    assert_eq!(mgr.staged().rules.len(), 3, "other rules stay");
+    assert_eq!(mgr.dedupe_monitor_rules().unwrap(), 0);
+
+    assert_eq!(mgr.remove_monitor_rules("DP-4").unwrap(), 1);
+    assert!(mgr.remove_monitor_rules("DP-4").is_err());
+    assert_eq!(monitor_lines(&mgr), vec!["monitor_rule=name:eDP-1,scale:1"]);
+}
+
+#[test]
+fn test_merge_rule_and_from_rule() {
+    let old = Rule::parse("monitor_rule", "name:A,width:800,height:600,scale:2,hdr:1").unwrap();
+    let new = Rule::parse("monitor_rule", "name:A,scale:1,x:10").unwrap();
+    assert_eq!(
+        merge_rule(&old, &new, &[]).body(),
+        "name:A,width:800,height:600,scale:1,hdr:1,x:10"
+    );
+    assert_eq!(
+        merge_rule(&old, &new, MONITOR_FORM_KEYS).body(),
+        "name:A,scale:1,hdr:1,x:10"
+    );
+    let m = Monitor::from_rule(&old);
+    assert_eq!(
+        (m.width, m.height, m.scale),
+        (Some(800), Some(600), Some(2.0))
+    );
+    assert_eq!(
+        Monitor::from_rule(&m.to_rule().unwrap()).to_config_line(),
+        m.to_config_line()
+    );
 }

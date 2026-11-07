@@ -141,8 +141,11 @@ impl BarPage {
 
     /// Rebuild the button rows when the buttons or their places changed.
     pub(super) fn load_buttons(self: &Rc<Self>, bar: &BarConfig) {
-        let places: Vec<Option<&str>> =
-            bar.buttons.iter().map(|b| bar.button_section(&b.id)).collect();
+        let places: Vec<Option<&str>> = bar
+            .buttons
+            .iter()
+            .map(|b| bar.button_section(&b.id))
+            .collect();
         let sig = format!(
             "{:?} {:?} {}",
             bar.backend,
@@ -341,7 +344,11 @@ impl BarPage {
                 "Picture {} · Mangobar cannot draw pictures: it shows {} instead. \
                  Pictures need Waybar",
                 file_name(&b.picture),
-                if b.emoji.is_empty() { "the label" } else { "the emoji" }
+                if b.emoji.is_empty() {
+                    "the label"
+                } else {
+                    "the emoji"
+                }
             )
         } else {
             format!("Picture {}", file_name(&b.picture))

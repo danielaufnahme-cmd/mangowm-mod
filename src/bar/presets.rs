@@ -199,7 +199,15 @@ pub const BAR_PRESETS: &[BarPreset] = &[
         tag_fill: true,
         left: FULL_LEFT,
         center: &[],
-        right: &["cpu", "memory", "pulseaudio", "network", "battery", "clock", "tray"],
+        right: &[
+            "cpu",
+            "memory",
+            "pulseaudio",
+            "network",
+            "battery",
+            "clock",
+            "tray",
+        ],
     },
 ];
 
@@ -345,7 +353,12 @@ impl UserPreset {
     /// Set the preset's settings on `bar`; the program, login start and
     /// monitors stay.
     pub fn apply(&self, bar: &mut BarConfig) {
-        let keep = (bar.backend, bar.start_at_login, bar.output.clone(), bar.preset.clone());
+        let keep = (
+            bar.backend,
+            bar.start_at_login,
+            bar.output.clone(),
+            bar.preset.clone(),
+        );
         *bar = self.bar.clone();
         (bar.backend, bar.start_at_login, bar.output, bar.preset) = keep;
     }
@@ -382,7 +395,9 @@ pub fn list_user_presets(data_dir: &Path) -> Vec<UserPreset> {
 }
 
 pub fn find_user_preset(data_dir: &Path, slug: &str) -> Option<UserPreset> {
-    list_user_presets(data_dir).into_iter().find(|p| p.slug == slug)
+    list_user_presets(data_dir)
+        .into_iter()
+        .find(|p| p.slug == slug)
 }
 
 fn check_name(data_dir: &Path, name: &str, except: Option<&str>) -> Result<String> {

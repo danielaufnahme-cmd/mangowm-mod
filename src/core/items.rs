@@ -498,3 +498,92 @@ impl Monitor {
             .unwrap_or_default()
     }
 }
+
+/// Monitor-rule keys the `Monitor` builder (and the GUI form) owns.
+pub const MONITOR_FORM_KEYS: &[&str] = &[
+    "width", "height", "refresh", "x", "y", "scale", "rr", "vrr", "disable", "primary",
+];
+
+impl Monitor {
+    /// The builder's view of a `monitor_rule` (keys it does not know are ignored).
+    pub fn from_rule(rule: &Rule) -> Monitor {
+        fn num<T: std::str::FromStr>(rule: &Rule, k: &str) -> Option<T> {
+            rule.get(k).and_then(|v| v.trim().parse().ok())
+        }
+        let on = |k: &str| rule.get(k).map(|v| v.trim() == "1");
+        Monitor {
+            name: rule.get("name").unwrap_or_default().to_string(),
+            width: num(rule, "width"),
+            height: num(rule, "height"),
+            refresh: num(rule, "refresh"),
+            x: num(rule, "x"),
+            y: num(rule, "y"),
+            scale: num(rule, "scale"),
+            transform: num(rule, "rr"),
+            vrr: on("vrr"),
+            disable: on("disable").unwrap_or(false),
+            primary: on("primary").unwrap_or(false),
+        }
+    }
+}
+
+/// `new` merged into `old`: keys of `new` replace the old values in place,
+/// keys only `new` has are appended, and keys listed in `clear` that `new`
+/// leaves out are dropped. Every other old key is kept.
+pub fn merge_rule(old: &Rule, new: &Rule, clear: &[&str]) -> Rule {
+    let mut fields: Vec<(String, String)> = old
+        .fields
+        .iter()
+        .filter_map(|(k, v)| match new.get(k) {
+            Some(nv) => Some((k.clone(), nv.to_string())),
+            None if clear.contains(&k.as_str()) => None,
+            None => Some((k.clone(), v.clone())),
+        })
+        .collect();
+    for (k, v) in &new.fields {
+        if !fields.iter().any(|(fk, _)| fk == k) {
+            fields.push((k.clone(), v.clone()));
+        }
+    }
+    Rule {
+        kind: new.kind.clone(),
+        fields,
+    }
+}
+
+/// Indexes of the `monitor_rule`s in `rules` whose `name` is `name`.
+pub fn monitor_rule_indexes(rules: &[Rule], name: &str) -> Vec<usize> {
+    rules
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == "monitor_rule" && r.get("name") == Some(name))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Drop every `monitor_rule` whose name already had an earlier one (Mango
+/// only uses the first match). Returns how many were removed.
+pub fn dedupe_monitor_rules(rules: &mut Vec<Rule>) -> usize {
+    let before = rules.len();
+    let mut seen: Vec<String> = Vec::new();
+    rules.retain(|r| {
+        if r.kind != "monitor_rule" {
+            return true;
+        }
+        let Some(name) = r.get("name") else {
+            return true;
+        };
+        if seen.iter().any(|s| s == name) {
+            return false;
+        }
+        seen.push(name.to_string());
+        true
+    });
+    before - rules.len()
+}
+
+/// Number of `monitor_rule`s that are shadowed by an earlier one for the same name.
+pub fn duplicate_monitor_rules(rules: &[Rule]) -> usize {
+    let mut copy = rules.to_vec();
+    dedupe_monitor_rules(&mut copy)
+}

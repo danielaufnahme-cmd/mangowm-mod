@@ -247,13 +247,16 @@ fn mean(samples: &[[f32; 3]]) -> [f32; 3] {
 fn widest_axis(samples: &[[f32; 3]]) -> (usize, f32) {
     (0..3)
         .map(|i| {
-            let (lo, hi) = samples
-                .iter()
-                .fold((f32::MAX, f32::MIN), |(lo, hi), s| (lo.min(s[i]), hi.max(s[i])));
+            let (lo, hi) = samples.iter().fold((f32::MAX, f32::MIN), |(lo, hi), s| {
+                (lo.min(s[i]), hi.max(s[i]))
+            });
             // L spans 0-1, a/b only about +-0.3: weigh them up to compare
             (i, (hi - lo) * if i == 0 { 1.0 } else { 2.0 })
         })
-        .fold((0, f32::MIN), |best, cur| if cur.1 > best.1 { cur } else { best })
+        .fold(
+            (0, f32::MIN),
+            |best, cur| if cur.1 > best.1 { cur } else { best },
+        )
 }
 
 /// Median cut into `k` boxes, then k-means rounds from the box means.
@@ -440,7 +443,11 @@ fn palette_from_clusters(clusters: &[Cluster], spots: &[Cluster]) -> Palette {
                 .then(|| Lch::new(0.7, 0.06, tint_h))
         });
 
-    let accent = Lch::new(primary.l.clamp(0.72, 0.82), primary.c.clamp(0.09, 0.15), primary.h);
+    let accent = Lch::new(
+        primary.l.clamp(0.72, 0.82),
+        primary.c.clamp(0.09, 0.15),
+        primary.h,
+    );
     let secondary = match second {
         Some(s) => Lch::new(s.l.clamp(0.64, 0.76), s.c.clamp(0.06, 0.13), s.h),
         // one-colour picture: a calmer, darker shade of the accent
@@ -514,9 +521,15 @@ pub fn window_colors(p: &Palette) -> Vec<(&'static str, String)> {
         ("urgent_color", p.urgent.hex_alpha(0xff)),
         ("root_color", p.background.hex_alpha(0xff)),
         ("scratchpad_color", p.secondary.hex_alpha(0xff)),
-        ("maximized_screen_color", p.accent.mix(p.text, 0.35).hex_alpha(0xff)),
+        (
+            "maximized_screen_color",
+            p.accent.mix(p.text, 0.35).hex_alpha(0xff),
+        ),
         ("global_color", p.secondary.mix(p.text, 0.3).hex_alpha(0xff)),
-        ("overlay_color", p.accent.mix(p.secondary, 0.5).hex_alpha(0xff)),
+        (
+            "overlay_color",
+            p.accent.mix(p.secondary, 0.5).hex_alpha(0xff),
+        ),
         ("drop_color", p.accent.hex_alpha(0x80)),
         ("split_color", p.secondary.hex_alpha(0xff)),
     ]
@@ -637,6 +650,9 @@ impl MatchSettings {
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<()> {
-        atomic_write(Self::path(data_dir), &(serde_json::to_string_pretty(self)? + "\n"))
+        atomic_write(
+            Self::path(data_dir),
+            &(serde_json::to_string_pretty(self)? + "\n"),
+        )
     }
 }

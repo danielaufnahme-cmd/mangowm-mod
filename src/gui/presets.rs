@@ -147,7 +147,11 @@ fn draw_windows(p: &Preset, cr: &gtk::cairo::Context, w: f64, h: f64) {
         (sx, y0 + sh + inner, sw, ah - sh - inner, false),
     ];
     for (x, y, ww, wh, focused) in wins {
-        let key = if focused { "focused_opacity" } else { "unfocused_opacity" };
+        let key = if focused {
+            "focused_opacity"
+        } else {
+            "unfocused_opacity"
+        };
         // a little see-through so the wallpaper still shows on the card
         rounded_rect(cr, x, y, ww, wh, radius);
         cr.set_source_rgba(body[0], body[1], body[2], opacity(key) * 0.6);
@@ -344,7 +348,10 @@ fn name_dialog(
     let d = dialog.clone();
     entry.connect_changed(move |e| d.set_response_enabled("ok", !empty(e)));
     dialog.connect_response(Some("ok"), move |_, _| {
-        done(&entry.text(), switch.as_ref().is_some_and(|s| s.is_active()));
+        done(
+            &entry.text(),
+            switch.as_ref().is_some_and(|s| s.is_active()),
+        );
     });
     dialog.present(Some(parent));
 }
@@ -405,10 +412,18 @@ fn user_menu(page: &Rc<Page>, p: &Preset) -> gtk::MenuButton {
         Box::new(move |w| {
             let pg = pg.clone();
             let id = pr.id.clone();
-            name_dialog(w, "Rename Preset", "", "Rename", &pr.name, None, move |name, _| {
-                let res = rename_user_preset(&pg.ctx.data_dir, &id, name);
-                pg.done(res.map(|p| format!("Renamed to {}", p.name)));
-            });
+            name_dialog(
+                w,
+                "Rename Preset",
+                "",
+                "Rename",
+                &pr.name,
+                None,
+                move |name, _| {
+                    let res = rename_user_preset(&pg.ctx.data_dir, &id, name);
+                    pg.done(res.map(|p| format!("Renamed to {}", p.name)));
+                },
+            );
         }),
     );
     let (pg, pr) = (page.clone(), p.clone());
@@ -572,7 +587,8 @@ impl Page {
                 continue;
             }
             let modified = preset_modified(&mgr, &c.preset, c.wallpaper.as_deref());
-            c.status.set_label(if modified { "Modified" } else { "Current" });
+            c.status
+                .set_label(if modified { "Modified" } else { "Current" });
             c.status.set_tooltip_text(Some(if modified {
                 "Your settings differ from this preset"
             } else {

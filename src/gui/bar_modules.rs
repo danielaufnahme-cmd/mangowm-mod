@@ -7,8 +7,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib::{self, clone};
 
-use mangowm_mod::bar::generate::{module_option_value, waybar_module_name};
 use mangowm_mod::bar::buttons::MODULE_PREFIX;
+use mangowm_mod::bar::generate::{module_option_value, waybar_module_name};
 use mangowm_mod::bar::model::{
     memory_displays, module_base, Backend, BarConfig, KNOWN_MODULES, SECTIONS,
 };

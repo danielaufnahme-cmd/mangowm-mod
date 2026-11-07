@@ -15,8 +15,7 @@ use gtk::{gio, glib};
 
 use mangowm_mod::bar::process::LiveUpdate;
 use mangowm_mod::palette::{
-    apply_bar_colors_live, palette_from_file, stage_window_colors,
-    MatchSettings, Palette,
+    apply_bar_colors_live, palette_from_file, stage_window_colors, MatchSettings, Palette,
 };
 use mangowm_mod::wallpaper::{
     bundled_dir, collect_wallpapers, current_wallpaper, mango_wallpaper, plasma_wallpaper_in,
@@ -161,7 +160,12 @@ fn apply(ctx: &Ctx, parent: &gtk::Widget, path: &Path) {
 
 /// Set the wallpaper; with `colors`, also its matched window colours (staged
 /// first, so the same apply writes them) and bar colours.
-fn set_now(ctx: &Ctx, parent: &gtk::Widget, path: &Path, colors: Option<&(Palette, MatchSettings)>) {
+fn set_now(
+    ctx: &Ctx,
+    parent: &gtk::Widget,
+    path: &Path,
+    colors: Option<&(Palette, MatchSettings)>,
+) {
     let mut what = "Wallpaper set";
     if let Some((palette, _)) = colors.filter(|(_, c)| c.windows) {
         let staged = stage_window_colors(&mut ctx.mgr.borrow_mut(), palette);
@@ -275,7 +279,9 @@ fn swatch(name: &str, color: Option<mangowm_mod::palette::Rgb>) -> gtk::Box {
     area.set_draw_func(move |_, cr, w, h| {
         rounded_rect(cr, 0.0, 0.0, w as f64, h as f64, 8.0);
         match color {
-            Some(c) => cr.set_source_rgb(c.r as f64 / 255.0, c.g as f64 / 255.0, c.b as f64 / 255.0),
+            Some(c) => {
+                cr.set_source_rgb(c.r as f64 / 255.0, c.g as f64 / 255.0, c.b as f64 / 255.0)
+            }
             None => cr.set_source_rgba(0.5, 0.5, 0.5, 0.12),
         }
         let _ = cr.fill_preserve();
@@ -349,7 +355,9 @@ impl Matcher {
         group.add(&strip_row);
         let windows = adw::SwitchRow::builder()
             .title("Window borders")
-            .subtitle("Focused border in the accent, the others from the palette (staged, then applied)")
+            .subtitle(
+                "Focused border in the accent, the others from the palette (staged, then applied)",
+            )
             .active(saved.windows)
             .build();
         let bar = adw::SwitchRow::builder()
@@ -424,9 +432,17 @@ impl Matcher {
             self.strip.remove(&c);
         }
         let roles = palette.map(|p| p.roles());
-        for (i, name) in ["Background", "Surface", "Text", "Accent", "Secondary", "Urgent", "Muted"]
-            .iter()
-            .enumerate()
+        for (i, name) in [
+            "Background",
+            "Surface",
+            "Text",
+            "Accent",
+            "Secondary",
+            "Urgent",
+            "Muted",
+        ]
+        .iter()
+        .enumerate()
         {
             self.strip
                 .append(&swatch(name, roles.as_ref().map(|r| r[i].1)));
@@ -452,7 +468,8 @@ impl Matcher {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.group.set_description(Some(&format!("Reading {}…", name)));
+        self.group
+            .set_description(Some(&format!("Reading {}…", name)));
         let w = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let p = path.clone();
@@ -554,8 +571,7 @@ pub fn page(ctx: &Ctx) -> gtk::Widget {
     let m = matcher.clone();
     ctx.on_change(move || {
         m.refresh();
-        let now = mango_wallpaper(&c.mgr.borrow())
-            .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+        let now = mango_wallpaper(&c.mgr.borrow()).map(|p| std::fs::canonicalize(&p).unwrap_or(p));
         for card in &cards {
             card.mango.set_visible(now.as_ref() == Some(&card.path));
         }
@@ -593,4 +609,3 @@ pub fn page(ctx: &Ctx) -> gtk::Widget {
         .build()
         .upcast()
 }
-
