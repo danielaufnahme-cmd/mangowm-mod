@@ -479,14 +479,53 @@ fn css_color(backend: Backend, color: &str, alpha: Option<u8>) -> String {
     }
 }
 
-/// CSS radius: Mangobar draws -1 as a pill, GTK clamps a large radius.
-fn css_radius(backend: Backend, radius: i32) -> String {
-    match (backend, radius < 0) {
-        (Backend::Mangobar, true) => "-1".to_string(),
-        (Backend::Waybar, true) => "999px".to_string(),
-        _ => format!("{}px", radius),
+/// Mangobar fills the bar's middle (#bar) with pixman, which takes the color
+/// as premultiplied, while modules are drawn with cairo from straight alpha
+/// (mangobar `draw_bar`, `paint_module`). The #bar color is premultiplied
+/// here so a see-through bar has the same shade under and between modules.
+pub fn premultiplied(color: &str) -> String {
+    let (r, g, b, a) = rgba(color);
+    let m = |c: u8| ((c as u32 * a as u32 + 127) / 255) as u8;
+    format!("#{:02x}{:02x}{:02x}{:02x}", m(r), m(g), m(b), a)
+}
+
+/// CSS radius; a pill (-1) is a large radius. Mangobar's CSS parser drops
+/// the minus sign (`-1` becomes 1 px, mangobar `parse_int`) and clamps the
+/// radius to half the height (`module_radius`); GTK clamps it too.
+fn css_radius(radius: i32) -> String {
+    if radius < 0 {
+        "999px".to_string()
+    } else {
+        format!("{}px", radius)
     }
 }
+
+/// Workspace tags: (side padding, side margin). The tags sit close together
+/// as one group: 1 px each side (2 px between) where modules have a gap.
+pub fn tag_spacing(bar: &BarConfig) -> (u32, u32) {
+    let pad = (bar.module_padding * 2 / 3).max(4);
+    let gap = if mangobar_continuous(bar) || bar.module_gap == 0 {
+        0
+    } else {
+        1
+    };
+    (pad, gap)
+}
+
+/// Waybar: how far the tag buttons sit inside the workspaces island, so the
+/// active pill has a frame of the island around it. None on square modules
+/// (a solid block) or an island without a color.
+fn waybar_tag_inset(bar: &BarConfig) -> u32 {
+    if bar.module_radius == 0 || alpha(&bar.module_bg_color) == 0 {
+        0
+    } else {
+        3
+    }
+}
+
+/// Fast color change on hover and tag switches (Waybar; Mangobar has no
+/// transitions).
+const TRANSITION: &str = "120ms ease-out";
 
 /// `font-family` value. Mangobar reads only one family (mangobar `style.c`),
 /// so it gets the first Nerd Font in the list (for the icons), else the first.
@@ -569,7 +608,10 @@ pub fn generate_style(bar: &BarConfig) -> String {
             c.to_string()
         }
     };
-    let bg = css_color(be, &bar.bg_color, None);
+    let bg = match be {
+        Backend::Mangobar => premultiplied(&bar.bg_color),
+        Backend::Waybar => css_color(be, &bar.bg_color, None),
+    };
     let fg = css_color(be, &bar.fg_color, None);
     let accent = css_color(be, &on_bar(&bar.accent_color), None);
     let surface = css_color(be, &surface_color(bar), None);
@@ -577,15 +619,16 @@ pub fn generate_style(bar: &BarConfig) -> String {
     let hover = css_color(be, &on_bar(&bar.hover_color), None);
     let urgent = css_color(be, &on_bar(&bar.urgent_color), None);
     let inactive = css_color(be, &bar.inactive_color, None);
-    let radius = css_radius(be, bar.radius);
+    let radius = css_radius(bar.radius);
     let (mut pad, vm, mut gap) = (bar.module_padding, bar.module_margin, bar.module_gap);
-    let mut mr = css_radius(be, bar.module_radius);
+    let mut mr = css_radius(bar.module_radius);
     if continuous {
         // margins would be holes in the bar: the gap becomes padding
         pad += gap;
         gap = 0;
         mr = "0px".to_string();
     }
+    let (tag_pad, tag_gap) = tag_spacing(bar);
 
     let mut ids: Vec<String> = Vec::new();
     let mut workspaces = false;
@@ -618,44 +661,102 @@ pub fn generate_style(bar: &BarConfig) -> String {
     let size = bar.font_size;
 
     match be {
+        // Mangobar reads only: color, background(-color), border-radius,
+        // padding(-left/-right), margin(-left/-right; -top on #bar),
+        // min-width, the font-* trio and border-color in menus (mangobar
+        // `style.c` `apply_decl`). Every module and tag is painted at the
+        // bar's full height; there are no borders, transitions or hover
+        // except on tags.
         Backend::Mangobar => {
             out.push_str(&format!(
                 "* {{\n    font-family: {font};\n    font-size: {size}px;\n    font-weight: {weight};\n}}\n\n"
             ));
             out.push_str(&format!(
-                "#bar {{\n    background-color: {bg};\n    color: {fg};\n    border-radius: {radius};\n    \
-                 margin-top: {}px;\n    margin-left: {}px;\n    margin-right: {}px;\n}}\n\n",
+                "#bar {{\n    background-color: {bg};\n    margin-top: {}px;\n    margin-left: {}px;\n    \
+                 margin-right: {}px;\n}}\n\n",
                 bar.margin_top, bar.margin_left, bar.margin_right
             ));
             if workspaces {
-                // tags carry the module color, so the tag row matches the modules
+                // Mangobar paints each tag on its own, so the tags are a row
+                // of equal blocks set close together: the island color under
+                // every tag, the accent pill on the active one. The hover
+                // rule is laid over whatever state the tag is in.
+                let tag_w = bar.module_height();
+                // tags in the middle of a continuous bar: see `in_center` below
+                let tags_mid = continuous
+                    && bar
+                        .modules
+                        .center
+                        .iter()
+                        .any(|m| module_base(m) == "workspaces");
+                let raw = |c: &str| css_color(be, c, None);
+                let (chip, hover, urgent, accent) = if tags_mid {
+                    (
+                        raw(&bar.module_bg_color),
+                        raw(&bar.hover_color),
+                        raw(&bar.urgent_color),
+                        raw(&bar.accent_color),
+                    )
+                } else {
+                    (chip.clone(), hover.clone(), urgent.clone(), accent.clone())
+                };
                 let (active_bg, active_fg) = if bar.tag_fill {
                     (accent.clone(), surface.clone())
                 } else {
                     (chip.clone(), accent.clone())
                 };
                 out.push_str(&format!(
-                    "#tags {{\n    padding: 0px {pad}px;\n    margin: 0px {gap}px;\n    color: {inactive};\n    \
-                     background-color: {chip};\n    border-radius: {mr};\n}}\n\n\
-                     #tags:hover {{\n    background-color: {hover};\n    color: {fg};\n}}\n\n\
-                     #tags.active {{\n    background-color: {active_bg};\n    color: {active_fg};\n}}\n\n\
+                    "#tags {{\n    padding: 0px {tag_pad}px;\n    margin: 0px {tag_gap}px;\n    \
+                     min-width: {tag_w}px;\n    color: {inactive};\n    background-color: {chip};\n    \
+                     border-radius: {mr};\n}}\n\n\
+                     #tags.empty {{\n    color: {inactive};\n}}\n\n\
                      #tags.occupied {{\n    color: {fg};\n}}\n\n\
+                     #tags.active {{\n    background-color: {active_bg};\n    color: {active_fg};\n}}\n\n\
                      #tags.urgent {{\n    background-color: {urgent};\n    color: {surface};\n}}\n\n\
-                     #tags.empty,\n#tags.inactive {{\n    color: {inactive};\n}}\n\n\
-                     #overview {{\n    background-color: {accent};\n    color: {surface};\n}}\n\n"
+                     #tags:hover {{\n    background-color: {hover};\n    color: {fg};\n}}\n\n\
+                     #overview {{\n    padding: 0px {pad}px;\n    margin: 0px {gap}px;\n    \
+                     background-color: {accent};\n    color: {surface};\n    border-radius: {mr};\n}}\n\n"
                 ));
             }
-            if !ids.is_empty() {
+            // A continuous bar's middle (#bar, painted from the end of the
+            // left group to the right group) is under the center modules
+            // too: they get their own color, not blended over the bar again.
+            let in_center = |id: &String| {
+                continuous
+                    && bar
+                        .modules
+                        .center
+                        .iter()
+                        .any(|m| css_id(be, m, bar.waybar_mango_modules).as_ref() == Some(id))
+                    && !bar
+                        .modules
+                        .left
+                        .iter()
+                        .chain(&bar.modules.right)
+                        .any(|m| css_id(be, m, bar.waybar_mango_modules).as_ref() == Some(id))
+            };
+            let (center_ids, side_ids): (Vec<String>, Vec<String>) =
+                ids.iter().cloned().partition(|id| in_center(id));
+            let center_chip = css_color(be, &bar.module_bg_color, None);
+            for (list, ground) in [(&side_ids, &chip), (&center_ids, &center_chip)] {
+                if list.is_empty() {
+                    continue;
+                }
                 out.push_str(&format!(
                     "{} {{\n    padding: 0px {pad}px;\n    margin: 0px {gap}px;\n    color: {fg};\n    \
-                     background-color: {chip};\n    border-radius: {mr};\n}}\n\n",
-                    ids.join(",\n")
+                     background-color: {ground};\n    border-radius: {mr};\n}}\n\n",
+                    list.join(",\n")
                 ));
             }
-            // tray menus (border-color is only read for menus)
+            // tray menus: the only place Mangobar draws a border
+            let edge = if bar.border_width > 0 && alpha(&bar.border_color) > 0 {
+                css_color(be, &bar.border_color, None)
+            } else {
+                hover.clone()
+            };
             out.push_str(&format!(
-                "menu {{\n    background-color: {surface};\n    color: {fg};\n    border-color: {hover};\n}}\n\n\
-                 menuitem:hover {{\n    background-color: {hover};\n}}\n"
+                "menu {{\n    background-color: {surface};\n    color: {fg};\n    border-color: {edge};\n}}\n\n\
+                 menuitem:hover {{\n    background-color: {hover};\n    color: {fg};\n}}\n"
             ));
         }
         Backend::Waybar => {
@@ -678,26 +779,35 @@ pub fn generate_style(bar: &BarConfig) -> String {
                  tooltip label {{\n    color: {fg};\n}}\n\n"
             ));
             if workspaces {
+                // one island holds the tags; the buttons sit inside it
+                let inset = waybar_tag_inset(bar);
+                let inner = if bar.module_radius < 0 {
+                    "999px".to_string()
+                } else {
+                    format!("{}px", (bar.module_radius - inset as i32).max(0))
+                };
                 let active = if bar.tag_fill {
                     format!("background-color: {accent};\n    color: {surface};")
                 } else {
                     format!("color: {accent};\n    box-shadow: inset 0 -2px {accent};")
                 };
                 out.push_str(&format!(
-                    "#workspaces button {{\n    padding: 0 {pad}px;\n    margin: {vm}px {gap}px;\n    color: {inactive};\n    \
-                     background-color: {chip};\n    border-radius: {mr};\n    box-shadow: none;\n    \
-                     transition: background-color 150ms ease, color 150ms ease;\n}}\n\n\
+                    "#workspaces {{\n    padding: 0 {inset}px;\n    margin: {vm}px {gap}px;\n    \
+                     background-color: {chip};\n    border-radius: {mr};\n}}\n\n\
+                     #workspaces button {{\n    padding: 0 {tag_pad}px;\n    margin: {inset}px {tag_gap}px;\n    \
+                     color: {fg};\n    background: transparent;\n    border-radius: {inner};\n    box-shadow: none;\n    \
+                     transition: background-color {TRANSITION}, color {TRANSITION};\n}}\n\n\
                      #workspaces button:hover {{\n    background: {hover};\n    color: {fg};\n    box-shadow: none;\n}}\n\n\
+                     #workspaces button.empty {{\n    color: {inactive};\n}}\n\n\
                      #workspaces button.active {{\n    {active}\n}}\n\n\
-                     #workspaces button.urgent {{\n    background-color: {urgent};\n    color: {surface};\n}}\n\n\
-                     #workspaces button.empty {{\n    color: {inactive};\n}}\n\n"
+                     #workspaces button.urgent {{\n    background-color: {urgent};\n    color: {surface};\n}}\n\n"
                 ));
             }
             if !ids.is_empty() {
                 out.push_str(&format!(
                     "{} {{\n    padding: 0 {pad}px;\n    margin: {vm}px {gap}px;\n    color: {fg};\n    \
                      background-color: {chip};\n    border-radius: {mr};\n    \
-                     transition: background-color 150ms ease;\n}}\n\n",
+                     transition: background-color {TRANSITION};\n}}\n\n",
                     ids.join(",\n")
                 ));
                 let hovers: Vec<String> = ids.iter().map(|i| format!("{}:hover", i)).collect();

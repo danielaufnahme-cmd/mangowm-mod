@@ -1,7 +1,9 @@
 use mangowm_mod::bar::generate::{
-    blend_over, generate_config, generate_style, warnings, write_bar_files,
+    alpha, blend_over, generate_config, generate_style, mangobar_continuous, premultiplied,
+    warnings, write_bar_files,
 };
 use mangowm_mod::bar::model::{Backend, BarConfig, Mangobar};
+use mangowm_mod::bar::presets::{find_bar_preset, BAR_PRESETS};
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -291,8 +293,14 @@ fn test_picker_colors_reach_css() {
     bar.set("fg", "#ddeeffff").unwrap();
     bar.set("accent", "#ff8000cc").unwrap();
     let css = generate_style(&bar);
+    // Mangobar fills #bar with pixman: the color goes in premultiplied
     assert!(
-        css.contains("#bar {\n    background-color: #1a2b3c80;\n    color: #ddeeffff;"),
+        css.contains("#bar {\n    background-color: #0d161e80;"),
+        "{}",
+        css
+    );
+    assert!(
+        css.contains("#tags.occupied {\n    color: #ddeeffff;"),
         "{}",
         css
     );
@@ -309,7 +317,7 @@ fn test_picker_colors_reach_css() {
     bar.set("inactive", "#ddeeff80").unwrap();
     let css = generate_style(&bar);
     assert!(
-        css.contains("#tags.empty,\n#tags.inactive {\n    color: #ddeeff80;"),
+        css.contains("#tags.empty {\n    color: #ddeeff80;"),
         "{}",
         css
     );
@@ -382,8 +390,8 @@ fn test_all_options_reach_both_programs() {
         "font-family: \"Symbols Nerd Font\";",
         "font-size: 15px;",
         "font-weight: SemiBold;",
-        "background-color: #10203040;\n    color: #a0b0c0ff;\n    border-radius: -1;\n    \
-         margin-top: 3px;\n    margin-left: 5px;\n    margin-right: 6px;",
+        "#bar {\n    background-color: #04080c40;\n    margin-top: 3px;\n    margin-left: 5px;\n    \
+         margin-right: 6px;\n}",
         "#tags.active {\n    background-color: #00ff00ff;",
         "#tags.urgent {\n    background-color: #ff0000ff;",
         "color: #0a0b0cff;",
@@ -405,12 +413,20 @@ fn test_all_options_reach_both_programs() {
         assert!(css.contains(&want), "missing {:?} in\n{}", want, css);
     }
     assert!(!css.contains("rgba(") && !css.contains("border: "));
+    // border-color is read only in menus
+    assert!(
+        css.contains("menu {\n    background-color: #102030ff;"),
+        "{}",
+        css
+    );
+    assert!(css.contains("    border-color: #abcdef80;\n}"), "{}", css);
     // clear bar: modules are separate blocks with their own margin and radius
     bar.set("bg", "#10203000").unwrap();
     let css = generate_style(&bar);
     for want in [
         "padding: 0px 11px;\n    margin: 0px 3px;",
-        "background-color: #01020304;\n    border-radius: -1;",
+        // a pill is a large radius: Mangobar reads "-1" as 1 px
+        "background-color: #01020304;\n    border-radius: 999px;",
     ] {
         assert!(css.contains(want), "missing {:?} in\n{}", want, css);
     }
@@ -790,8 +806,7 @@ fn test_window_title_is_capped() {
 
 #[test]
 fn test_bar_presets() {
-    use mangowm_mod::bar::generate::{alpha, mangobar_continuous};
-    use mangowm_mod::bar::presets::{find_bar_preset, BAR_PRESETS, DEFAULT_BAR_PRESET};
+    use mangowm_mod::bar::presets::DEFAULT_BAR_PRESET;
     assert!((4..=6).contains(&BAR_PRESETS.len()));
     // a fresh bar.json is the default preset
     let default = find_bar_preset(DEFAULT_BAR_PRESET).unwrap();
@@ -875,4 +890,331 @@ fn test_bar_presets() {
     bar.set("position", "bottom").unwrap();
     let pill = find_bar_preset("floating-pill").unwrap().applied_to(&bar);
     assert_eq!((pill.margin_top, pill.margin_bottom), (0, 8));
+}
+
+/// Selectors of a generated stylesheet with their declarations, in order.
+fn css_rules(css: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let mut out = Vec::new();
+    let mut rest = css;
+    while let Some(open) = rest.find('{') {
+        let selector = rest[..open]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("/*"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string();
+        let close = open + rest[open..].find('}').expect("unclosed rule");
+        let decls = rest[open + 1..close]
+            .split(';')
+            .filter_map(|d| d.split_once(':'))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect();
+        out.push((selector, decls));
+        rest = &rest[close + 1..];
+    }
+    out
+}
+
+/// Declarations of the first rule whose selector list contains `selector`.
+fn rule<'a>(
+    rules: &'a [(String, Vec<(String, String)>)],
+    selector: &str,
+) -> &'a [(String, String)] {
+    rules
+        .iter()
+        .find(|(s, _)| s.split(',').any(|s| s.trim() == selector))
+        .map(|(_, d)| d.as_slice())
+        .unwrap_or_else(|| panic!("no rule for {}", selector))
+}
+
+fn decl<'a>(decls: &'a [(String, String)], prop: &str) -> Option<&'a str> {
+    decls
+        .iter()
+        .rev()
+        .find(|(k, _)| k == prop)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Properties mangobar 0.2.2 reads (`style.c` `apply_decl`); anything else
+/// is silently ignored, so the generator must not rely on it.
+const MANGOBAR_PROPS: &[&str] = &[
+    "color",
+    "background",
+    "background-color",
+    "border-color",
+    "border-radius",
+    "min-width",
+    "padding",
+    "padding-left",
+    "padding-right",
+    "margin",
+    "margin-top",
+    "margin-left",
+    "margin-right",
+    "font-family",
+    "font-size",
+    "font-weight",
+];
+
+fn assert_mangobar_css_supported(css: &str, what: &str) {
+    for (selector, decls) in css_rules(css) {
+        for (prop, value) in &decls {
+            assert!(
+                MANGOBAR_PROPS.contains(&prop.as_str()),
+                "{}: {} {{ {} }} is not read by Mangobar",
+                what,
+                selector,
+                prop
+            );
+            // the parser drops minus signs and reads only hex colors
+            assert!(
+                !value.contains('-'),
+                "{}: {} {}: {}",
+                what,
+                selector,
+                prop,
+                value
+            );
+            if prop.contains("color") || prop == "background" {
+                assert!(
+                    value.starts_with('#') && value.len() == 9,
+                    "{}: {} {}: {}",
+                    what,
+                    selector,
+                    prop,
+                    value
+                );
+            }
+        }
+        if decls.iter().any(|(p, _)| p == "border-color") {
+            assert_eq!(selector, "menu", "{}: border-color outside menus", what);
+        }
+        if decls.iter().any(|(p, _)| p == "margin-top") {
+            assert_eq!(selector, "#bar", "{}: margin-top on a module", what);
+        }
+        // Mangobar has hover only for tags (and menu items)
+        if selector.contains(":hover") {
+            assert!(
+                selector == "#tags:hover" || selector == "menuitem:hover",
+                "{}: {}",
+                what,
+                selector
+            );
+        }
+    }
+}
+
+/// The islands look in Mangobar honours the bar.json colors and sizes, and
+/// the tags are a close row of dark blocks with the accent on the active one.
+#[test]
+fn test_mangobar_islands_style() {
+    let mut bar = full_bar(Backend::Mangobar);
+    find_bar_preset("islands").unwrap().apply(&mut bar);
+    // the user's own colors must reach the CSS, not built-in ones
+    bar.set("module-bg", "#20242aee").unwrap();
+    bar.set("inactive", "#8a909aff").unwrap();
+    bar.set("hover", "#30343cff").unwrap();
+    bar.set("urgent", "#e06c75ff").unwrap();
+    let css = generate_style(&bar);
+    assert_mangobar_css_supported(&css, "islands");
+    let rules = css_rules(&css);
+
+    let all = rule(&rules, "*");
+    assert_eq!(
+        decl(all, "font-family"),
+        Some("\"JetBrainsMono Nerd Font\"")
+    );
+    assert_eq!(decl(all, "font-size"), Some("13px"));
+    assert_eq!(decl(all, "font-weight"), Some("Medium"));
+
+    let b = rule(&rules, "#bar");
+    assert_eq!(decl(b, "background-color"), Some("#00000000"));
+    assert_eq!(decl(b, "margin-top"), Some("6px"));
+    assert_eq!(decl(b, "margin-left"), Some("8px"));
+    assert_eq!(decl(b, "margin-right"), Some("8px"));
+
+    let tags = rule(&rules, "#tags");
+    assert_eq!(decl(tags, "background-color"), Some("#20242aee"));
+    assert_eq!(decl(tags, "color"), Some("#8a909aff"));
+    assert_eq!(decl(tags, "border-radius"), Some("10px"));
+    // set close together (2 px apart) as one group, not module_gap apart
+    assert_eq!(decl(tags, "margin"), Some("0px 1px"));
+    assert_eq!(decl(tags, "padding"), Some("0px 8px"));
+    // equal blocks, as wide as the bar is tall
+    let h = bar.module_height();
+    assert_eq!(decl(tags, "min-width"), Some(format!("{}px", h).as_str()));
+
+    assert_eq!(
+        decl(rule(&rules, "#tags.empty"), "color"),
+        Some("#8a909aff")
+    );
+    assert_eq!(
+        decl(rule(&rules, "#tags.occupied"), "color"),
+        Some("#e6e8ebff")
+    );
+    let active = rule(&rules, "#tags.active");
+    assert_eq!(decl(active, "background-color"), Some("#76ccb1ff"));
+    assert_eq!(decl(active, "color"), Some("#20242aff"));
+    let urgent = rule(&rules, "#tags.urgent");
+    assert_eq!(decl(urgent, "background-color"), Some("#e06c75ff"));
+    let hover = rule(&rules, "#tags:hover");
+    assert_eq!(decl(hover, "background-color"), Some("#30343cff"));
+    assert_eq!(decl(hover, "color"), Some("#e6e8ebff"));
+    assert!(!css.contains("#tags.inactive"), "Mangobar never uses it");
+
+    // the layout and every other module: matching dark islands
+    for id in [
+        "#layout", "#title", "#clock", "#cpu", "#mem", "#volume", "#tray",
+    ] {
+        let m = rule(&rules, id);
+        assert_eq!(decl(m, "background-color"), Some("#20242aee"), "{}", id);
+        assert_eq!(decl(m, "color"), Some("#e6e8ebff"), "{}", id);
+        assert_eq!(decl(m, "padding"), Some("0px 12px"), "{}", id);
+        assert_eq!(decl(m, "margin"), Some("0px 3px"), "{}", id);
+        assert_eq!(decl(m, "border-radius"), Some("10px"), "{}", id);
+    }
+}
+
+/// Pill radii, see-through bars and the center group in Mangobar.
+#[test]
+fn test_mangobar_pill_and_continuous_bar() {
+    assert_eq!(premultiplied("#ffffff80"), "#80808080");
+    assert_eq!(premultiplied("#10203000"), "#00000000");
+    assert_eq!(premultiplied("#123456ff"), "#123456ff");
+
+    let mut bar = full_bar(Backend::Mangobar);
+    bar.set("module-radius", "pill").unwrap();
+    let css = generate_style(&bar);
+    assert!(
+        !css.contains("-1"),
+        "Mangobar reads border-radius: -1 as 1 px"
+    );
+    assert_eq!(
+        decl(rule(&css_rules(&css), "#cpu"), "border-radius"),
+        Some("999px")
+    );
+
+    // the minimal preset: a see-through bar with text-only modules
+    let mut bar = full_bar(Backend::Mangobar);
+    find_bar_preset("minimal").unwrap().apply(&mut bar);
+    assert!(mangobar_continuous(&bar));
+    let css = generate_style(&bar);
+    assert_mangobar_css_supported(&css, "minimal");
+    let rules = css_rules(&css);
+    assert_eq!(
+        decl(rule(&rules, "#bar"), "background-color"),
+        Some(premultiplied(&bar.bg_color).as_str())
+    );
+    // side modules paint the bar color themselves...
+    let side = blend_over(&bar.module_bg_color, &bar.bg_color);
+    assert_eq!(
+        decl(rule(&rules, "#volume"), "background-color"),
+        Some(side.as_str())
+    );
+    assert_eq!(
+        decl(rule(&rules, "#tags"), "background-color"),
+        Some(side.as_str())
+    );
+    // ...the center ones sit on the bar's middle, which is painted already
+    assert_eq!(
+        decl(rule(&rules, "#clock"), "background-color"),
+        Some("#00000000")
+    );
+    // no holes in a continuous bar
+    assert_eq!(decl(rule(&rules, "#tags"), "margin"), Some("0px 0px"));
+    assert_eq!(decl(rule(&rules, "#volume"), "margin"), Some("0px 0px"));
+    // active tag: accent text when the preset does not fill it
+    assert_eq!(
+        decl(rule(&rules, "#tags.active"), "color"),
+        Some(bar.accent_color.as_str())
+    );
+}
+
+/// Every preset gives Mangobar only CSS it reads, and dark islands for
+/// tags and modules where the bar itself is clear.
+#[test]
+fn test_presets_mangobar_css_supported() {
+    for p in BAR_PRESETS {
+        let bar = p.applied_to(&full_bar(Backend::Mangobar));
+        let css = generate_style(&bar);
+        assert_mangobar_css_supported(&css, p.id);
+        let rules = css_rules(&css);
+        let tags = rule(&rules, "#tags");
+        let ground = if alpha(&bar.bg_color) > 0 {
+            blend_over(&bar.module_bg_color, &bar.bg_color)
+        } else {
+            bar.module_bg_color.clone()
+        };
+        // tags and modules never sit on nothing: the text keeps its contrast
+        assert!(alpha(&ground) >= 0xa0, "{}: {}", p.id, ground);
+        assert_eq!(
+            decl(tags, "background-color"),
+            Some(ground.as_str()),
+            "{}",
+            p.id
+        );
+        assert_eq!(
+            decl(rule(&rules, "#title"), "background-color"),
+            Some(ground.as_str()),
+            "{}",
+            p.id
+        );
+        assert_eq!(
+            decl(tags, "color"),
+            Some(bar.inactive_color.as_str()),
+            "{}",
+            p.id
+        );
+    }
+}
+
+/// Waybar: the tags are one island with the buttons inside it, and colors
+/// change quickly.
+#[test]
+fn test_waybar_workspaces_island() {
+    let mut bar = full_bar(Backend::Waybar);
+    find_bar_preset("islands").unwrap().apply(&mut bar);
+    let css = generate_style(&bar);
+    let rules = css_rules(&css);
+    let island = rule(&rules, "#workspaces");
+    assert_eq!(
+        decl(island, "background-color"),
+        Some("rgba(22, 24, 28, 0.902)")
+    );
+    assert_eq!(decl(island, "border-radius"), Some("10px"));
+    assert_eq!(decl(island, "margin"), Some("0px 3px"));
+    let button = rule(&rules, "#workspaces button");
+    assert_eq!(decl(button, "background"), Some("transparent"));
+    assert_eq!(decl(button, "color"), Some("rgba(230, 232, 235, 1)"));
+    // inset in the island, with a radius that follows the island's
+    assert_eq!(decl(button, "margin"), Some("3px 1px"));
+    assert_eq!(decl(button, "border-radius"), Some("7px"));
+    assert!(decl(button, "transition").unwrap().contains("120ms"));
+    assert_eq!(
+        decl(rule(&rules, "#workspaces button.empty"), "color"),
+        Some("rgba(124, 130, 140, 1)")
+    );
+    assert_eq!(
+        decl(
+            rule(&rules, "#workspaces button.active"),
+            "background-color"
+        ),
+        Some("rgba(118, 204, 177, 1)")
+    );
+    assert_eq!(
+        decl(rule(&rules, "#workspaces button:hover"), "background"),
+        Some("rgba(42, 46, 53, 1)")
+    );
+    assert!(decl(rule(&rules, "#clock"), "transition")
+        .unwrap()
+        .contains("120ms"));
+
+    // square modules: the active tag is a solid block, edge to edge
+    let dock = find_bar_preset("solid-dock").unwrap().applied_to(&bar);
+    let css = generate_style(&dock);
+    assert_eq!(
+        decl(rule(&css_rules(&css), "#workspaces button"), "margin"),
+        Some("0px 0px")
+    );
 }

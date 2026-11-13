@@ -382,7 +382,8 @@ pub struct BarConfig {
     /// Module corner radius; -1 = pill.
     #[serde(default = "default_module_radius")]
     pub module_radius: i32,
-    /// Waybar only (Mangobar draws no bar border).
+    /// Waybar draws it round the bar; Mangobar has no bar or module border and
+    /// uses the border color only for the edge of tray menus.
     #[serde(default = "default_border_width")]
     pub border_width: u32,
     #[serde(default = "default_border_color")]

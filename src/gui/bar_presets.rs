@@ -7,7 +7,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{cairo, gio, glib};
 
-use mangowm_mod::bar::generate::{alpha, mangobar_continuous, surface_color};
+use mangowm_mod::bar::generate::{alpha, mangobar_continuous, surface_color, tag_spacing};
 use mangowm_mod::bar::model::{module_base, Backend, BarConfig};
 use mangowm_mod::bar::presets::{
     delete_user_preset, find_user_preset, list_user_presets, overwrite_user_preset,
@@ -167,7 +167,17 @@ fn draw_bar(cr: &cairo::Context, bar: &BarConfig, w: f64, h: f64) {
         (top, height)
     };
     let spacing = if waybar { bar.spacing as f64 } else { 0.0 };
+    // tags are set close together as one group (see `tag_spacing`)
+    let (tag_pad, tag_gap) = tag_spacing(bar);
+    let spacing_of = |e: &Entry| {
+        if e.1 == Tag::No {
+            (pad, gap)
+        } else {
+            (tag_pad as f64, tag_gap as f64)
+        }
+    };
     let width = |e: &Entry| {
+        let (pad, gap) = spacing_of(e);
         let body = if e.0.is_empty() {
             2.0 * 14.0 + 6.0 + 2.0 * pad
         } else {
@@ -186,6 +196,7 @@ fn draw_bar(cr: &cairo::Context, bar: &BarConfig, w: f64, h: f64) {
     };
     let surface = surface_color(bar);
     let draw_entry = |e: &Entry, x: f64| -> f64 {
+        let (pad, gap) = spacing_of(e);
         let ew = width(e);
         let bx = x + gap;
         let bwid = ew - 2.0 * gap;
